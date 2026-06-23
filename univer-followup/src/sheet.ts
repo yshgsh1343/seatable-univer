@@ -19,8 +19,6 @@ import SheetsSortUIZhCN from '@univerjs/sheets-sort-ui/locale/zh-CN';
 import { UniverSheetsTablePlugin } from '@univerjs/sheets-table';
 import { UniverSheetsUIPlugin } from '@univerjs/sheets-ui';
 import SheetsUIZhCN from '@univerjs/sheets-ui/locale/zh-CN';
-import { UniverSheetsZenEditorPlugin } from '@univerjs/sheets-zen-editor';
-import SheetsZenEditorZhCN from '@univerjs/sheets-zen-editor/locale/zh-CN';
 import { UniverUIPlugin } from '@univerjs/ui';
 import UIZhCN from '@univerjs/ui/locale/zh-CN';
 
@@ -28,7 +26,6 @@ import '@univerjs/design/lib/index.css';
 import '@univerjs/ui/lib/index.css';
 import '@univerjs/docs-ui/lib/index.css';
 import '@univerjs/sheets-ui/lib/index.css';
-import '@univerjs/sheets-zen-editor/lib/index.css';
 import '@univerjs/sheets-filter-ui/lib/index.css';
 import '@univerjs/sheets-sort-ui/lib/index.css';
 import '@univerjs/sheets/facade';
@@ -1108,137 +1105,10 @@ function activeWorkbook() {
   return api?.getActiveWorkbook?.();
 }
 
-function beginCellEditing(workbook: any, worksheet?: any, row?: number, column?: number) {
-  if (!workbook || workbook.isCellEditing?.()) return;
-  if (worksheet && Number.isInteger(row) && Number.isInteger(column)) {
-    const range = worksheet.getRange?.(row, column);
-    if (range) {
-      workbook.setActiveRange?.(range);
-      worksheet.setActiveRange?.(range);
-    }
-  }
-  const start = (fallbackWorkbook = workbook) => {
-    const latestWorkbook = activeWorkbook() || workbook;
-    const targetWorkbook = latestWorkbook || fallbackWorkbook;
-    if (!targetWorkbook || targetWorkbook.isCellEditing?.()) return;
-    targetWorkbook.startEditing?.();
-  };
-  [0, 60, 140].forEach((delay) => window.setTimeout(start, delay));
-}
-
 function facadeValueToText(value: any) {
   if (value === null || value === undefined) return '';
   if (typeof value?.toPlainText === 'function') return value.toPlainText().trim();
   return String(value).trim();
-}
-
-function activeElementAcceptsText() {
-  const active = document.activeElement as HTMLElement | null;
-  if (!active) return false;
-  if (active.tagName === 'TEXTAREA' || active.tagName === 'INPUT') return true;
-  return active.isContentEditable;
-}
-
-function removeFallbackEditor() {
-  document.querySelector('.cell-edit-fallback')?.remove();
-}
-
-function fallbackCellRect(event: MouseEvent, workbook: any, rangeInfo: any) {
-  const canvas = document.querySelector('canvas[data-u-comp="render-canvas"]') as HTMLCanvasElement | null;
-  const canvasRect = canvas?.getBoundingClientRect();
-  const snapshot = workbook.save?.();
-  const sheet = snapshot?.sheets?.[rangeInfo.sheetId] || Object.values(snapshot?.sheets || {})[0] as any;
-  const columnData = sheet?.columnData || {};
-  const rowData = sheet?.rowData || {};
-  const defaultColumnWidth = Number(sheet?.defaultColumnWidth || 120);
-  const defaultRowHeight = Number(sheet?.defaultRowHeight || 28);
-  const rowHeaderWidth = 96;
-
-  const columnWidth = (col: number) => {
-    const data = columnData[col] || {};
-    if (data.hd) return 0;
-    return Number(data.w || defaultColumnWidth);
-  };
-  const rowHeight = (row: number) => Number(rowData[row]?.h || defaultRowHeight);
-
-  const width = Math.max(columnWidth(rangeInfo.startColumn), 72);
-  const height = Math.max(rowHeight(rangeInfo.startRow), 30);
-  let left = event.clientX - width / 2;
-  let top = event.clientY - height / 2;
-
-  if (canvasRect) {
-    const sheetLeft = canvasRect.left + rowHeaderWidth;
-    const modelLeft = Array.from({ length: rangeInfo.startColumn }, (_, index) => columnWidth(index)).reduce((sum, value) => sum + value, 0);
-    const modelTop = Array.from({ length: rangeInfo.startRow }, (_, index) => rowHeight(index)).reduce((sum, value) => sum + value, 0);
-    const candidateLeft = sheetLeft + modelLeft;
-    const candidateTop = canvasRect.top + modelTop;
-    const eventInsideCandidate = event.clientX >= candidateLeft - 4
-      && event.clientX <= candidateLeft + width + 4
-      && event.clientY >= candidateTop - 4
-      && event.clientY <= candidateTop + height + 4;
-    if (eventInsideCandidate) {
-      left = candidateLeft;
-      top = candidateTop;
-    }
-  }
-
-  return {
-    left: Math.max(8, Math.min(left, window.innerWidth - width - 8)),
-    top: Math.max(8, Math.min(top, window.innerHeight - height - 8)),
-    width,
-    height,
-  };
-}
-
-function openFallbackCellEditor(event: MouseEvent) {
-  const workbook = activeWorkbook();
-  const worksheet = workbook?.getActiveSheet?.();
-  const rangeInfo = workbook?.getActiveRange?.()?.getRange?.();
-  if (!workbook || !worksheet || !rangeInfo) return;
-  if (rangeInfo.startRow < HEADER_ROWS) return;
-
-  const range = worksheet.getRange?.(rangeInfo.startRow, rangeInfo.startColumn);
-  if (!range) return;
-  const initialValue = facadeValueToText(range.getValue?.(true) ?? range.getValue?.());
-  removeFallbackEditor();
-
-  const editor = document.createElement('textarea');
-  editor.className = 'cell-edit-fallback';
-  editor.value = initialValue;
-  const rect = fallbackCellRect(event, workbook, rangeInfo);
-  editor.style.left = `${rect.left}px`;
-  editor.style.top = `${rect.top}px`;
-  editor.style.width = `${rect.width}px`;
-  editor.style.height = `${rect.height}px`;
-  document.body.appendChild(editor);
-  editor.focus();
-  editor.select();
-
-  let committed = false;
-  const close = (save: boolean) => {
-    if (committed) return;
-    committed = true;
-    if (save) {
-      range.setValue?.(editor.value);
-      statusEl.textContent = '单元格已编辑，等待自动写回';
-    }
-    if (workbook.isCellEditing?.()) {
-      if (workbook.endEditingAsync) void workbook.endEditingAsync(false);
-      else void workbook.endEditing?.(false);
-    }
-    editor.remove();
-  };
-  editor.addEventListener('keydown', (keyboardEvent) => {
-    if (keyboardEvent.key === 'Enter' && !keyboardEvent.shiftKey) {
-      keyboardEvent.preventDefault();
-      close(true);
-    }
-    if (keyboardEvent.key === 'Escape') {
-      keyboardEvent.preventDefault();
-      close(false);
-    }
-  });
-  editor.addEventListener('blur', () => close(true));
 }
 
 function ensureDataFilter(sheet: any, selectedColumn: number) {
@@ -1332,28 +1202,6 @@ function registerContextMenuActions() {
     action: clearQuickFilters,
     order: 21,
   })?.appendTo?.(['contextMenu.mainArea', 'contextMenu.others']);
-}
-
-function installLeftDoubleClickEditing() {
-  const root = document.getElementById('app');
-  if (!root || root.dataset.leftDoubleClickEditing === '1') return;
-  root.dataset.leftDoubleClickEditing = '1';
-
-  root.addEventListener('dblclick', (event) => {
-    if (event.button !== 0) return;
-    const target = event.target as HTMLElement | null;
-    if (target?.closest('input, textarea, select, button, [contenteditable="true"]')) return;
-    const mouseEvent = event;
-    window.setTimeout(() => {
-      const workbook = activeWorkbook();
-      if (!workbook) return;
-      if (workbook.isCellEditing?.() && activeElementAcceptsText()) return;
-      if (!workbook.isCellEditing?.()) beginCellEditing(workbook, workbook.getActiveSheet?.());
-      window.setTimeout(() => {
-        if (!activeElementAcceptsText()) openFallbackCellEditor(mouseEvent);
-      }, 80);
-    }, 120);
-  });
 }
 
 async function workbookSnapshot(finishEditing: boolean) {
@@ -1551,7 +1399,6 @@ async function boot() {
         DocsUIZhCN,
         SheetsZhCN,
         SheetsUIZhCN,
-        SheetsZenEditorZhCN,
         SheetsFilterUIZhCN,
         SheetsSortUIZhCN,
       ),
@@ -1568,7 +1415,6 @@ async function boot() {
     autoHeightForMergedCells: false,
   });
   univer.registerPlugin(UniverSheetsUIPlugin);
-  univer.registerPlugin(UniverSheetsZenEditorPlugin);
   univer.registerPlugin(UniverSheetsNumfmtPlugin);
   univer.registerPlugin(UniverSheetsFilterPlugin);
   univer.registerPlugin(UniverSheetsFilterUIPlugin);
@@ -1580,7 +1426,6 @@ async function boot() {
   univer.createUnit(UniverInstanceType.UNIVER_SHEET, makeWorkbook(payload) as any);
   (window as any).univer = univer;
   (window as any).univerAPI = FUniver.newAPI(univer);
-  installLeftDoubleClickEditing();
   registerContextMenuActions();
   statusEl.textContent = '已加载，双击或输入可编辑';
   startRealtimeSync();
