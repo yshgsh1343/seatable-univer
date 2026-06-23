@@ -797,6 +797,54 @@ func compactRow(row map[string]any, columns map[string]string) map[string]any {
 	return out
 }
 
+func comparableCell(value any) string {
+	if value == nil {
+		return ""
+	}
+	if text, ok := value.(string); ok {
+		return text
+	}
+	if list, ok := value.([]any); ok {
+		raw, _ := json.Marshal(list)
+		return string(raw)
+	}
+	if obj, ok := value.(map[string]any); ok {
+		raw, _ := json.Marshal(obj)
+		return string(raw)
+	}
+	return fmt.Sprint(value)
+}
+
+func changedRawPatch(existing map[string]any, columns map[string]string, patch map[string]any) map[string]any {
+	if existing == nil {
+		return patch
+	}
+	out := map[string]any{}
+	for name, value := range patch {
+		columnKey := columns[name]
+		if columnKey == "" {
+			continue
+		}
+		if comparableCell(existing[columnKey]) != comparableCell(value) {
+			out[name] = value
+		}
+	}
+	return out
+}
+
+func changedNamedPatch(existing map[string]any, patch map[string]any) map[string]any {
+	if existing == nil {
+		return patch
+	}
+	out := map[string]any{}
+	for name, value := range patch {
+		if comparableCell(existing[name]) != comparableCell(value) {
+			out[name] = value
+		}
+	}
+	return out
+}
+
 func firstExistingColumn(columns map[string]string, names ...string) string {
 	for _, name := range names {
 		if _, ok := columns[name]; ok {
@@ -928,10 +976,9 @@ func (a *app) syncToSeaTable(payload map[string]any) (map[string]any, error) {
 		patientID := fmt.Sprint(patient["patient_id"])
 		markPresent(seenPatients, patientID)
 		rowID := ""
-		if row := rows[patientID]; row != nil {
-			rowID = fmt.Sprint(row["_id"])
-		} else {
-			skippedPatients++
+		existingPatient := rows[patientID]
+		if existingPatient != nil {
+			rowID = fmt.Sprint(existingPatient["_id"])
 		}
 		patch := compactRow(patient, patientColumns)
 		if patientID := strings.TrimSpace(fmt.Sprint(patient["patient_id"])); patientID != "" {
@@ -944,8 +991,8 @@ func (a *app) syncToSeaTable(payload map[string]any) (map[string]any, error) {
 				}
 			}
 		}
+		patch = changedRawPatch(existingPatient, patientColumns, patch)
 		if len(patch) == 0 {
-			skippedPatients++
 			continue
 		}
 		if err := a.upsertRow(token, primaryTable, rowID, patch); err != nil {
@@ -990,6 +1037,10 @@ func (a *app) syncToSeaTable(payload map[string]any) (map[string]any, error) {
 		if _, ok := drugColumns["原始值"]; ok && fmt.Sprint(patch["原始值"]) == "" {
 			patch["原始值"] = fmt.Sprintf("IC50=%s; 抑制率=%s", patch["IC50"], patch["抑制率"])
 		}
+		patch = changedNamedPatch(existingDrugs[key], patch)
+		if len(patch) == 0 {
+			continue
+		}
 		if err := a.upsertRow(token, drugTable, rowID, patch); err != nil {
 			return nil, err
 		}
@@ -1029,6 +1080,10 @@ func (a *app) syncToSeaTable(payload map[string]any) (map[string]any, error) {
 		seenFollowups[key] = true
 		rowID := existingRowID(existingFollowups, key)
 		patch := compactRow(followup, followupColumns)
+		patch = changedNamedPatch(existingFollowups[key], patch)
+		if len(patch) == 0 {
+			continue
+		}
 		if err := a.upsertRow(token, followupTable, rowID, patch); err != nil {
 			return nil, err
 		}
@@ -1103,8 +1158,12 @@ func (a *app) syncRawTablesToSeaTable(token string, meta map[string]any, payload
 		if err != nil {
 			return updatedTables, updatedRows, deletedRows, err
 		}
+		currentRowsByID := map[string]map[string]any{}
 		for _, row := range currentRows {
 			rowID := strings.TrimSpace(fmt.Sprint(row["_id"]))
+			if rowID != "" {
+				currentRowsByID[rowID] = row
+			}
 			if rowID == "" || submittedIDs[rowID] {
 				continue
 			}
@@ -1116,6 +1175,7 @@ func (a *app) syncRawTablesToSeaTable(token string, meta map[string]any, payload
 		for _, row := range rows {
 			rowID := fmt.Sprint(row["_id"])
 			patch := compactRow(row, columns)
+			patch = changedRawPatch(currentRowsByID[strings.TrimSpace(rowID)], columns, patch)
 			if len(patch) == 0 {
 				continue
 			}
