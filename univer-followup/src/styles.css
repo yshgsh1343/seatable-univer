@@ -734,9 +734,70 @@ button:hover {
 
 .empty-note,
 .sheet-loading {
-  padding: 24px;
   color: #64748b;
   font-size: 13px;
+}
+
+.sheet-loading {
+  display: flex;
+  min-height: 220px;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 10px;
+  padding: 24px;
+  box-sizing: border-box;
+}
+
+.loading-line {
+  position: relative;
+  width: min(420px, 72vw);
+  height: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #dbe4ef;
+}
+
+.loading-bar {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 42%;
+  border-radius: inherit;
+  background: #2563eb;
+  animation: loading-slide 1.1s ease-in-out infinite;
+}
+
+.loading-line.stopped .loading-bar {
+  width: 100%;
+  animation: none;
+  background: #dc2626;
+}
+
+.loading-title {
+  color: #172033;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.loading-subtitle {
+  max-width: min(620px, 84vw);
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+@keyframes loading-slide {
+  0% {
+    transform: translateX(-110%);
+  }
+  55% {
+    transform: translateX(85%);
+  }
+  100% {
+    transform: translateX(240%);
+  }
 }
 
 .sheet-mode #app {

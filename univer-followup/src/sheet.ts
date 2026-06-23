@@ -70,18 +70,9 @@ const expanded = localStorage.getItem('drug_columns_collapsed') === '0';
 
 const summaryEl = document.getElementById('summary')!;
 const statusEl = document.getElementById('status')!;
-const toggleEl = document.getElementById('toggleDrugs') as HTMLButtonElement;
 const reloadEl = document.getElementById('reloadFull') as HTMLButtonElement;
 const saveSyncEl = document.getElementById('saveSync') as HTMLButtonElement;
 const refreshSyncEl = document.getElementById('refreshSync') as HTMLButtonElement;
-const expandAllEl = document.getElementById('expandAll') as HTMLButtonElement;
-const collapseAllEl = document.getElementById('collapseAll') as HTMLButtonElement;
-const toggleClinicalGroupEl = document.getElementById('toggleClinicalGroup') as HTMLButtonElement;
-const togglePathologyGroupEl = document.getElementById('togglePathologyGroup') as HTMLButtonElement;
-const toggleMolecularGroupEl = document.getElementById('toggleMolecularGroup') as HTMLButtonElement;
-const toggleImagingGroupEl = document.getElementById('toggleImagingGroup') as HTMLButtonElement;
-const toggleDrugGroupEl = document.getElementById('toggleDrugGroup') as HTMLButtonElement;
-const toggleFollowupGroupEl = document.getElementById('toggleFollowupGroup') as HTMLButtonElement;
 const columnPanelToggleEl = document.getElementById('columnPanelToggle') as HTMLButtonElement;
 const columnPanelEl = document.getElementById('columnPanel')!;
 
@@ -347,32 +338,11 @@ function reloadForColumns() {
   window.location.reload();
 }
 
-function setGroupCollapsed(group: ColumnGroup, collapsed: boolean) {
-  const hidden = getHiddenColumnKeys();
-  buildColumnMeta().filter((meta) => meta.group === group).forEach((meta) => {
-    if (collapsed) hidden.add(meta.key);
-    else hidden.delete(meta.key);
-  });
-  setHiddenColumnKeys(hidden);
-  reloadForColumns();
-}
-
-function toggleColumnGroup(group: ColumnGroup) {
-  const metas = buildColumnMeta().filter((meta) => meta.group === group);
-  const hidden = getHiddenColumnKeys();
-  const visibleCount = metas.filter((meta) => !hidden.has(meta.key)).length;
-  setGroupCollapsed(group, visibleCount > 0);
-}
-
-function showAllGroups() {
-  setHiddenColumnKeys(new Set());
-  reloadForColumns();
-}
-
-function collapseAllGroups() {
+function setVisibleColumnGroups(groups: ColumnGroup[]) {
+  const visible = new Set(groups);
   const hidden = new Set<string>();
   buildColumnMeta().forEach((meta) => {
-    if (meta.group !== 'basic') hidden.add(meta.key);
+    if (!visible.has(meta.group)) hidden.add(meta.key);
   });
   setHiddenColumnKeys(hidden);
   reloadForColumns();
@@ -382,6 +352,9 @@ function renderColumnPanel() {
   const metas = buildColumnMeta();
   const hidden = getHiddenColumnKeys();
   const hiddenCount = metas.filter((meta) => hidden.has(meta.key)).length;
+  const drugModeAction = workbookHeaders().length ? '' : `
+        <button type="button" data-column-action="toggle-drug-detail">${expanded ? '药敏摘要' : '药敏明细'}</button>
+  `;
   const groupHtml = groupOrder.map((group) => {
     const groupMetas = metas.filter((meta) => meta.group === group);
     const visibleCount = groupMetas.filter((meta) => !hidden.has(meta.key)).length;
@@ -443,8 +416,10 @@ function renderColumnPanel() {
       <div class="column-panel-tools">
         <button type="button" data-column-action="apply">应用</button>
         <button type="button" data-column-action="show-all">全部显示</button>
-        <button type="button" data-column-action="clinical">只看基本+药敏</button>
-        <button type="button" data-column-action="hide-drug">隐藏药敏</button>
+        <button type="button" data-column-action="only-basic">仅基本</button>
+        <button type="button" data-column-action="basic-drug">基本+药敏</button>
+        <button type="button" data-column-action="basic-followup">基本+随访</button>
+        ${drugModeAction}
         <button type="button" data-column-action="close">关闭</button>
       </div>
     </div>
@@ -626,7 +601,7 @@ function payloadFromSnapshot(snapshot: any, original: FollowupPayload): Followup
   if (hasRawTables(original)) return payloadFromRawSnapshot(snapshot, original);
   if (workbookHeaders(original).length) return payloadFromXlsxSnapshot(snapshot, original);
   if (!expanded) {
-    throw new Error('请先展开药敏明细后再保存联动');
+    throw new Error('请先在列显示中切换到药敏明细后再保存联动');
   }
   const sheet = snapshot?.sheets?.['followup-sheet'];
   const cells = sheet?.cellData || {};
@@ -1110,6 +1085,24 @@ function activeWorkbook() {
   return api?.getActiveWorkbook?.();
 }
 
+function beginCellEditing(workbook: any, worksheet?: any, row?: number, column?: number) {
+  if (!workbook || workbook.isCellEditing?.()) return;
+  if (worksheet && Number.isInteger(row) && Number.isInteger(column)) {
+    const range = worksheet.getRange?.(row, column);
+    if (range) {
+      workbook.setActiveRange?.(range);
+      worksheet.setActiveRange?.(range);
+    }
+  }
+  const start = (fallbackWorkbook = workbook) => {
+    const latestWorkbook = activeWorkbook() || workbook;
+    const targetWorkbook = latestWorkbook || fallbackWorkbook;
+    if (!targetWorkbook || targetWorkbook.isCellEditing?.()) return;
+    targetWorkbook.startEditing?.();
+  };
+  [0, 60, 140].forEach((delay) => window.setTimeout(start, delay));
+}
+
 function facadeValueToText(value: any) {
   if (value === null || value === undefined) return '';
   if (typeof value?.toPlainText === 'function') return value.toPlainText().trim();
@@ -1217,6 +1210,7 @@ function installLeftDoubleClickEditing() {
   const api = (window as any).univerAPI;
   let lastClick: { row: number; column: number; at: number } | null = null;
   api?.addEvent?.(api.Event.CellPointerDown, (params: any) => {
+    if (params?.event?.button === 2 || params?.button === 2) return;
     const now = window.performance.now();
     const isDoubleClick = lastClick
       && lastClick.row === params.row
@@ -1227,25 +1221,8 @@ function installLeftDoubleClickEditing() {
 
     const workbook = params.workbook || activeWorkbook();
     const worksheet = params.worksheet || workbook?.getActiveSheet?.();
-    const range = worksheet?.getRange?.(params.row, params.column);
-    if (!workbook || !range || workbook.isCellEditing?.()) return;
-
-    workbook.setActiveRange?.(range);
-    window.requestAnimationFrame(() => {
-      if (!workbook.isCellEditing?.()) workbook.startEditing?.();
-    });
+    beginCellEditing(workbook, worksheet, params.row, params.column);
   });
-
-  root.addEventListener('dblclick', (event) => {
-    if (event.button !== 0) return;
-    const target = event.target as HTMLElement | null;
-    if (target?.closest('input, textarea, select, button, [contenteditable="true"]')) return;
-    window.requestAnimationFrame(() => {
-      const workbook = activeWorkbook();
-      if (!workbook || workbook.isCellEditing?.()) return;
-      workbook.startEditing?.();
-    });
-  }, true);
 }
 
 async function workbookSnapshot(finishEditing: boolean) {
@@ -1369,7 +1346,7 @@ async function pollRemoteState() {
 
 function startRealtimeSync() {
   if (currentPayload && !hasRawTables(currentPayload) && !expanded && !workbookHeaders(currentPayload).length) {
-    statusEl.textContent = '摘要视图已加载，展开药敏后启用实时写回';
+    statusEl.textContent = '摘要视图已加载，在列显示中切换到药敏明细后启用实时写回';
     return;
   }
   window.setTimeout(async () => {
@@ -1394,6 +1371,11 @@ function startRealtimeSync() {
         lastRemoteSignature = signature;
         return;
       }
+      if (currentPayload && !hasRawTables(currentPayload)) {
+        lastRemoteSignature = signature;
+        statusEl.textContent = 'SeaTable 有更新，嵌套视图保持当前数据';
+        return;
+      }
       await refreshFromSeaTable('自动');
     } catch (error) {
       statusEl.textContent = 'SeaTable 远端检查失败';
@@ -1409,18 +1391,7 @@ async function boot() {
   const openSheetEl = document.getElementById('openSheet');
   if (openSheetEl) openSheetEl.hidden = true;
   document.getElementById('app')!.innerHTML = '';
-  let payload: FollowupPayload = await fetch('/followup.json').then((response) => response.json());
-  if (!hasRawTables(payload)) {
-    statusEl.textContent = '正在从 SeaTable 初始化原表 sheets';
-    const response = await fetch('/api/refresh', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: '{}',
-    });
-    const result = await response.json();
-    if (!response.ok || !result.ok) throw new Error(result.error || `HTTP ${response.status}`);
-    payload = result.payload;
-  }
+  const payload: FollowupPayload = await fetch('/followup.json').then((response) => response.json());
   currentPayload = payload;
   summaryEl.hidden = false;
   const metas = buildColumnMeta();
@@ -1429,16 +1400,7 @@ async function boot() {
     const rawRows = (payload.raw_tables || []).reduce((sum, table) => sum + (table.rows?.length || 0), 0);
     summaryEl.textContent = `${payload.raw_tables?.length || 0} 张 SeaTable 表 · ${rawRows} 行`;
     [
-      toggleEl,
       reloadEl,
-      expandAllEl,
-      collapseAllEl,
-      toggleClinicalGroupEl,
-      togglePathologyGroupEl,
-      toggleMolecularGroupEl,
-      toggleImagingGroupEl,
-      toggleDrugGroupEl,
-      toggleFollowupGroupEl,
       columnPanelToggleEl,
     ].forEach((item) => {
       item.hidden = true;
@@ -1446,7 +1408,6 @@ async function boot() {
     columnPanelEl.hidden = true;
   } else {
     summaryEl.textContent = `${payload.patients.length} 位患者 · 药敏 ${payload.drug_sensitivity.length} 条 · 随访 ${payload.followups.length} 条 · ${expanded ? '药敏明细展开' : '药敏摘要视图'} · 隐藏 ${hiddenCount} 列`;
-    toggleEl.textContent = expanded ? '收起药敏明细' : '展开药敏明细';
     renderColumnPanel();
   }
 
@@ -1498,39 +1459,6 @@ saveSyncEl.addEventListener('click', async () => {
 
 refreshSyncEl.addEventListener('click', async () => {
   await refreshFromSeaTable('手动');
-});
-
-expandAllEl.addEventListener('click', showAllGroups);
-
-collapseAllEl.addEventListener('click', collapseAllGroups);
-
-toggleClinicalGroupEl.addEventListener('click', () => {
-  toggleColumnGroup('clinical');
-});
-
-togglePathologyGroupEl.addEventListener('click', () => {
-  toggleColumnGroup('pathology');
-});
-
-toggleMolecularGroupEl.addEventListener('click', () => {
-  toggleColumnGroup('molecular');
-});
-
-toggleImagingGroupEl.addEventListener('click', () => {
-  toggleColumnGroup('imaging');
-});
-
-toggleDrugGroupEl.addEventListener('click', () => {
-  toggleColumnGroup('drug');
-});
-
-toggleFollowupGroupEl.addEventListener('click', () => {
-  toggleColumnGroup('followup');
-});
-
-toggleEl.addEventListener('click', () => {
-  localStorage.setItem('drug_columns_collapsed', expanded ? '1' : '0');
-  window.location.reload();
 });
 
 reloadEl.addEventListener('click', () => {
@@ -1591,8 +1519,6 @@ columnPanelEl.addEventListener('click', (event) => {
   const button = event.target instanceof HTMLElement ? event.target.closest('button[data-column-action]') : null;
   if (!(button instanceof HTMLButtonElement)) return;
   const action = button.dataset.columnAction;
-  const metas = buildColumnMeta();
-  const hidden = getHiddenColumnKeys();
 
   if (action === 'apply') {
     reloadForColumns();
@@ -1607,18 +1533,20 @@ columnPanelEl.addEventListener('click', (event) => {
     reloadForColumns();
     return;
   }
-  if (action === 'clinical') {
-    const next = new Set<string>();
-    metas.forEach((meta) => {
-      if (meta.group !== 'basic' && meta.group !== 'drug') next.add(meta.key);
-    });
-    setHiddenColumnKeys(next);
-    reloadForColumns();
+  if (action === 'only-basic') {
+    setVisibleColumnGroups(['basic']);
     return;
   }
-  if (action === 'hide-drug') {
-    metas.filter((meta) => meta.group === 'drug').forEach((meta) => hidden.add(meta.key));
-    setHiddenColumnKeys(hidden);
+  if (action === 'basic-drug') {
+    setVisibleColumnGroups(['basic', 'drug']);
+    return;
+  }
+  if (action === 'basic-followup') {
+    setVisibleColumnGroups(['basic', 'followup']);
+    return;
+  }
+  if (action === 'toggle-drug-detail') {
+    localStorage.setItem('drug_columns_collapsed', expanded ? '1' : '0');
     reloadForColumns();
   }
 });

@@ -167,18 +167,16 @@ func (a *app) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, apiError{OK: false, Error: "method not allowed"})
 		return
 	}
+	if payload, ok := a.currentStructuredPayload(); ok {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "payload": payload, "counts": payloadCounts(payload), "preserved": true})
+		return
+	}
 	payload, err := a.refreshFromSeaTable()
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, apiError{OK: false, Error: err.Error()})
 		return
 	}
-	counts := map[string]int{
-		"patients":  len(asRows(payload["patients"])),
-		"drugs":     len(asRows(payload["drug_sensitivity"])),
-		"followups": len(asRows(payload["followups"])),
-		"tables":    len(asRows(payload["raw_tables"])),
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "payload": payload, "counts": counts})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "payload": payload, "counts": payloadCounts(payload)})
 }
 
 func (a *app) handleSave(w http.ResponseWriter, r *http.Request) {
@@ -1224,6 +1222,33 @@ func (a *app) savePayload(payload map[string]any, snapshot any) (string, error) 
 		_ = atomicWrite(filepath.Join(a.cfg.backupDir, "univer-"+time.Now().Format("20060102-150405.000000")+".json"), snapRaw)
 	}
 	return fmt.Sprint(payload["generated_at"]), nil
+}
+
+func (a *app) currentStructuredPayload() (map[string]any, bool) {
+	body, err := os.ReadFile(a.cfg.publicJSON)
+	if err != nil {
+		return nil, false
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, false
+	}
+	if len(asRows(payload["raw_tables"])) > 0 {
+		return nil, false
+	}
+	if len(asRows(payload["patients"])) == 0 {
+		return nil, false
+	}
+	return payload, true
+}
+
+func payloadCounts(payload map[string]any) map[string]int {
+	return map[string]int{
+		"patients":  len(asRows(payload["patients"])),
+		"drugs":     len(asRows(payload["drug_sensitivity"])),
+		"followups": len(asRows(payload["followups"])),
+		"tables":    len(asRows(payload["raw_tables"])),
+	}
 }
 
 func atomicWrite(path string, body []byte) error {
