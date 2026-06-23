@@ -85,6 +85,8 @@ var patientToSeaTable = map[string]string{
 	"分子分型 （基因检测结果）": "分子分型 （基因检测结果）",
 }
 
+var patientIDColumnCandidates = []string{"patient_id", "类器官样本号", "样本号"}
+
 func Run() error {
 	a := newApp(loadConfig())
 	addr := "0.0.0.0:" + a.cfg.port
@@ -795,6 +797,15 @@ func compactRow(row map[string]any, columns map[string]string) map[string]any {
 	return out
 }
 
+func firstExistingColumn(columns map[string]string, names ...string) string {
+	for _, name := range names {
+		if _, ok := columns[name]; ok {
+			return name
+		}
+	}
+	return ""
+}
+
 func existingRowID(rows map[string]map[string]any, key string) string {
 	row, ok := rows[key]
 	if !ok || row == nil || row["_id"] == nil {
@@ -896,9 +907,10 @@ func (a *app) syncToSeaTable(payload map[string]any) (map[string]any, error) {
 	patientColumns := tableColumns(meta, primaryTable)
 	drugColumns := tableColumns(meta, drugTable)
 	followupColumns := tableColumns(meta, followupTable)
-	patientKey := patientColumns["patient_id"]
-	if patientKey == "" {
-		return nil, errors.New("SeaTable 表缺少 patient_id 列")
+	patientIDColumn := firstExistingColumn(patientColumns, patientIDColumnCandidates...)
+	patientKey := patientColumns[patientIDColumn]
+	if patientIDColumn == "" || patientKey == "" {
+		return nil, errors.New("SeaTable 表缺少 patient_id/类器官样本号 列")
 	}
 	rawRows, err := a.gatewayRows(token, primaryTable)
 	if err != nil {
@@ -922,6 +934,9 @@ func (a *app) syncToSeaTable(payload map[string]any) (map[string]any, error) {
 			skippedPatients++
 		}
 		patch := compactRow(patient, patientColumns)
+		if patientID := strings.TrimSpace(fmt.Sprint(patient["patient_id"])); patientID != "" {
+			patch[patientIDColumn] = patientID
+		}
 		for source, target := range patientToSeaTable {
 			if _, ok := patientColumns[target]; ok {
 				if value, exists := patient[source]; exists {
