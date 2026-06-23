@@ -13,8 +13,10 @@
 
 - `compose.example.yaml`：脱敏后的 Compose 模板。
 - `.env.example`：环境变量模板。
-- `univer-followup/cmd/followup-go`：Go 服务，提供 `/api/refresh`、`/api/save` 和静态文件服务。
-- `univer-followup/cmd/import-xlsx`：Go XLSX 导入工具，支持冷备份和同名表替换。
+- `univer-followup/cmd/followup-go`：Go 服务入口。
+- `univer-followup/cmd/import-xlsx`：Go XLSX 导入工具入口。
+- `univer-followup/internal/followup`：SeaTable 刷新、保存、防覆盖校验和静态文件服务逻辑。
+- `univer-followup/internal/importer`：XLSX 解析、导入规划、冷备份和 SeaTable 表替换逻辑。
 - `univer-followup/src`：Univer 前端源码。
 
 运行数据、患者数据、备份、构建产物和真实密钥不会提交到 git。
