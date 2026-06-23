@@ -19,6 +19,8 @@ import SheetsSortUIZhCN from '@univerjs/sheets-sort-ui/locale/zh-CN';
 import { UniverSheetsTablePlugin } from '@univerjs/sheets-table';
 import { UniverSheetsUIPlugin } from '@univerjs/sheets-ui';
 import SheetsUIZhCN from '@univerjs/sheets-ui/locale/zh-CN';
+import { UniverSheetsZenEditorPlugin } from '@univerjs/sheets-zen-editor';
+import SheetsZenEditorZhCN from '@univerjs/sheets-zen-editor/locale/zh-CN';
 import { UniverUIPlugin } from '@univerjs/ui';
 import UIZhCN from '@univerjs/ui/locale/zh-CN';
 
@@ -26,6 +28,7 @@ import '@univerjs/design/lib/index.css';
 import '@univerjs/ui/lib/index.css';
 import '@univerjs/docs-ui/lib/index.css';
 import '@univerjs/sheets-ui/lib/index.css';
+import '@univerjs/sheets-zen-editor/lib/index.css';
 import '@univerjs/sheets-filter-ui/lib/index.css';
 import '@univerjs/sheets-sort-ui/lib/index.css';
 import '@univerjs/sheets/facade';
@@ -1129,6 +1132,65 @@ function facadeValueToText(value: any) {
   return String(value).trim();
 }
 
+function activeElementAcceptsText() {
+  const active = document.activeElement as HTMLElement | null;
+  if (!active) return false;
+  if (active.tagName === 'TEXTAREA' || active.tagName === 'INPUT') return true;
+  return active.isContentEditable;
+}
+
+function removeFallbackEditor() {
+  document.querySelector('.cell-edit-fallback')?.remove();
+}
+
+function openFallbackCellEditor(event: MouseEvent) {
+  const workbook = activeWorkbook();
+  const worksheet = workbook?.getActiveSheet?.();
+  const rangeInfo = workbook?.getActiveRange?.()?.getRange?.();
+  if (!workbook || !worksheet || !rangeInfo) return;
+  if (rangeInfo.startRow < HEADER_ROWS) return;
+
+  const range = worksheet.getRange?.(rangeInfo.startRow, rangeInfo.startColumn);
+  if (!range) return;
+  const initialValue = facadeValueToText(range.getValue?.(true) ?? range.getValue?.());
+  removeFallbackEditor();
+
+  const editor = document.createElement('textarea');
+  editor.className = 'cell-edit-fallback';
+  editor.value = initialValue;
+  editor.style.left = `${Math.min(event.clientX, window.innerWidth - 360)}px`;
+  editor.style.top = `${Math.min(event.clientY, window.innerHeight - 90)}px`;
+  document.body.appendChild(editor);
+  editor.focus();
+  editor.select();
+
+  let committed = false;
+  const close = (save: boolean) => {
+    if (committed) return;
+    committed = true;
+    if (save) {
+      range.setValue?.(editor.value);
+      statusEl.textContent = '单元格已编辑，等待自动写回';
+    }
+    if (workbook.isCellEditing?.()) {
+      if (workbook.endEditingAsync) void workbook.endEditingAsync(false);
+      else void workbook.endEditing?.(false);
+    }
+    editor.remove();
+  };
+  editor.addEventListener('keydown', (keyboardEvent) => {
+    if (keyboardEvent.key === 'Enter' && !keyboardEvent.shiftKey) {
+      keyboardEvent.preventDefault();
+      close(true);
+    }
+    if (keyboardEvent.key === 'Escape') {
+      keyboardEvent.preventDefault();
+      close(false);
+    }
+  });
+  editor.addEventListener('blur', () => close(true));
+}
+
 function ensureDataFilter(sheet: any, selectedColumn: number) {
   const rawMode = currentPayload ? hasRawTables(currentPayload) : false;
   const rawIndex = rawMode ? Number(String(sheet.getSheetId?.() || '').replace(RAW_SHEET_PREFIX, '')) : -1;
@@ -1227,21 +1289,20 @@ function installLeftDoubleClickEditing() {
   if (!root || root.dataset.leftDoubleClickEditing === '1') return;
   root.dataset.leftDoubleClickEditing = '1';
 
-  const api = (window as any).univerAPI;
-  let lastClick: { row: number; column: number; at: number } | null = null;
-  api?.addEvent?.(api.Event.CellPointerDown, (params: any) => {
-    if (params?.event?.button === 2 || params?.button === 2) return;
-    const now = window.performance.now();
-    const isDoubleClick = lastClick
-      && lastClick.row === params.row
-      && lastClick.column === params.column
-      && now - lastClick.at < 380;
-    lastClick = { row: params.row, column: params.column, at: now };
-    if (!isDoubleClick) return;
-
-    const workbook = params.workbook || activeWorkbook();
-    const worksheet = params.worksheet || workbook?.getActiveSheet?.();
-    beginCellEditing(workbook, worksheet, params.row, params.column);
+  root.addEventListener('dblclick', (event) => {
+    if (event.button !== 0) return;
+    const target = event.target as HTMLElement | null;
+    if (target?.closest('input, textarea, select, button, [contenteditable="true"]')) return;
+    const mouseEvent = event;
+    window.setTimeout(() => {
+      const workbook = activeWorkbook();
+      if (!workbook) return;
+      if (workbook.isCellEditing?.() && activeElementAcceptsText()) return;
+      if (!workbook.isCellEditing?.()) beginCellEditing(workbook, workbook.getActiveSheet?.());
+      window.setTimeout(() => {
+        if (!activeElementAcceptsText()) openFallbackCellEditor(mouseEvent);
+      }, 80);
+    }, 120);
   });
 }
 
@@ -1440,6 +1501,7 @@ async function boot() {
         DocsUIZhCN,
         SheetsZhCN,
         SheetsUIZhCN,
+        SheetsZenEditorZhCN,
         SheetsFilterUIZhCN,
         SheetsSortUIZhCN,
       ),
@@ -1456,6 +1518,7 @@ async function boot() {
     autoHeightForMergedCells: false,
   });
   univer.registerPlugin(UniverSheetsUIPlugin);
+  univer.registerPlugin(UniverSheetsZenEditorPlugin);
   univer.registerPlugin(UniverSheetsNumfmtPlugin);
   univer.registerPlugin(UniverSheetsFilterPlugin);
   univer.registerPlugin(UniverSheetsFilterUIPlugin);
