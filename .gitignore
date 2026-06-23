@@ -1,0 +1,25 @@
+.env
+compose.yaml
+
+# Runtime data, backups, and patient data
+data/
+backups/
+import/
+scripts/
+univer-followup/import/
+univer-followup/server.py
+univer-followup/public/followup.json*
+univer-followup/dist/
+univer-followup/sync-backups/
+univer-followup/cold-backups/
+univer-followup/xlsx_headers.json
+
+# Build and dependency outputs
+univer-followup/followup-go
+univer-followup/import-xlsx
+univer-followup/node_modules/
+univer-followup/__pycache__/
+
+# Local/editor noise
+.DS_Store
+*.log

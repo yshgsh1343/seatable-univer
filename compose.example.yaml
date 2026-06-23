@@ -1,0 +1,127 @@
+services:
+  mariadb:
+    image: mariadb:11.8.5-noble
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: "change-me"
+      MARIADB_AUTO_UPGRADE: "1"
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --innodb_snapshot_isolation=OFF
+    volumes:
+      - ./data/mysql:/var/lib/mysql
+    networks:
+      - seatable-bridge
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  redis:
+    image: redis:8.4.0-bookworm
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "change-me", "--maxmemory", "500mb", "--maxmemory-policy", "allkeys-lru"]
+    networks:
+      - seatable-bridge
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a change-me ping | grep PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  seatable:
+    image: seatable/seatable-developer:latest
+    restart: unless-stopped
+    ports:
+      - "6805:80"
+    expose:
+      - "80"
+    volumes:
+      - ./data/seatable:/shared
+    environment:
+      TIME_ZONE: "Asia/Shanghai"
+      SEATABLE_SERVER_HOSTNAME: "example.com:6805"
+      SEATABLE_SERVER_PROTOCOL: "http"
+      SEATABLE_ADMIN_EMAIL: "admin@example.com"
+      SEATABLE_ADMIN_PASSWORD: "change-me"
+      DB_HOST: "mariadb"
+      DB_ROOT_PASSWD: "change-me"
+      INIT_SEATABLE_MYSQL_ROOT_PASSWORD: "change-me"
+      SEATABLE_MYSQL_DB_HOST: "mariadb"
+      SEATABLE_MYSQL_DB_PORT: "3306"
+      SEATABLE_MYSQL_DB_USER: "seatable"
+      SEATABLE_MYSQL_DB_PASSWORD: "change-me"
+      SEATABLE_MYSQL_DB_DTABLE_DB_NAME: "dtable_db"
+      SEATABLE_MYSQL_DB_CCNET_DB_NAME: "ccnet_db"
+      SEATABLE_MYSQL_DB_SEAFILE_DB_NAME: "seafile_db"
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: "change-me"
+      JWT_PRIVATE_KEY: "change-me"
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      seatable-bridge:
+        aliases:
+          - seatable
+
+  snapshotter:
+    image: mariadb:11.8.5-noble
+    restart: unless-stopped
+    volumes:
+      - ./data:/data:ro
+      - ./backups:/backups
+    networks:
+      - seatable-bridge
+    environment:
+      MYSQL_PWD: "change-me"
+      TZ: "Asia/Shanghai"
+    command:
+      - /bin/bash
+      - -lc
+      - |
+        while true; do
+          stamp=$$(date +%Y%m%d-%H%M)
+          if [ ! -f "/backups/mysql-$$stamp.sql.gz" ]; then
+            mariadb-dump -hmariadb -uroot --single-transaction --quick --all-databases | gzip -c > "/backups/mysql-$$stamp.sql.gz"
+            tar -C /data -czf "/backups/seatable-shared-$$stamp.tar.gz" seatable
+            find /backups -type f -mmin +1440 -name "*.gz" -delete
+          fi
+          sleep 60
+        done
+    depends_on:
+      mariadb:
+        condition: service_healthy
+
+  univer-followup:
+    image: seatable/seatable-developer:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "6809:6809"
+    expose:
+      - "6809"
+    volumes:
+      - ./univer-followup:/app
+    working_dir: /app
+    environment:
+      PORT: "6809"
+      SEATABLE_URL: "http://seatable:80"
+      SEATABLE_WORKSPACE_ID: "1"
+      SEATABLE_BASE_NAME: "replace-with-base-name"
+    command: ["/app/followup-go"]
+    depends_on:
+      seatable:
+        condition: service_started
+    networks:
+      - seatable-bridge
+
+networks:
+  seatable-bridge:
+    driver: bridge
