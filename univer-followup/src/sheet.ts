@@ -85,6 +85,9 @@ let isRefreshing = false;
 let lastSavedWorkbookHash = '';
 let lastRemoteSignature = '';
 let lastLocalSaveAt = 0;
+let currentUniver: any = null;
+let syncInitTimer: number | null = null;
+let syncPollTimer: number | null = null;
 
 const xlsxHeaders = xlsxHeaderTemplate as string[];
 const headerAliases: Record<string, string> = {
@@ -1236,6 +1239,40 @@ function syncSummary(payload: FollowupPayload, suffix: string) {
   summaryEl.textContent = `${payload.patients.length} 位患者 · 药敏 ${payload.drug_sensitivity.length} 条 · 随访 ${payload.followups.length} 条 · ${suffix}`;
 }
 
+function updatePayloadSummary(payload: FollowupPayload, suffix = '') {
+  currentPayload = payload;
+  summaryEl.hidden = false;
+  const tail = suffix ? ` · ${suffix}` : '';
+  if (hasRawTables(payload)) {
+    const rawRows = (payload.raw_tables || []).reduce((sum, table) => sum + (table.rows?.length || 0), 0);
+    summaryEl.textContent = `${payload.raw_tables?.length || 0} 张 SeaTable 表 · ${rawRows} 行${tail}`;
+    [reloadEl, columnPanelToggleEl].forEach((item) => {
+      item.hidden = true;
+    });
+    columnPanelEl.hidden = true;
+    return;
+  }
+  [reloadEl, columnPanelToggleEl].forEach((item) => {
+    item.hidden = false;
+  });
+  columnPanelEl.hidden = false;
+  const metas = buildColumnMeta();
+  const hiddenCount = metas.filter((meta) => getHiddenColumnKeys().has(meta.key)).length;
+  summaryEl.textContent = `${payload.patients.length} 位患者 · 药敏 ${payload.drug_sensitivity.length} 条 · 随访 ${payload.followups.length} 条 · ${expanded ? '药敏明细展开' : '药敏摘要视图'} · 隐藏 ${hiddenCount} 列${tail}`;
+  renderColumnPanel();
+}
+
+function stopRealtimeSync() {
+  if (syncInitTimer !== null) {
+    window.clearTimeout(syncInitTimer);
+    syncInitTimer = null;
+  }
+  if (syncPollTimer !== null) {
+    window.clearInterval(syncPollTimer);
+    syncPollTimer = null;
+  }
+}
+
 async function saveCurrentWorkbook(mode: '手动' | '自动', finishEditing: boolean) {
   if (!currentPayload || isSaving || isRefreshing) return;
   if (!hasRawTables(currentPayload) && !expanded && !workbookHeaders(currentPayload).length) {
@@ -1295,22 +1332,25 @@ async function refreshFromSeaTable(mode: '手动' | '自动') {
   isRefreshing = true;
   try {
     if (mode === '手动') refreshSyncEl.disabled = true;
-    statusEl.textContent = mode === '自动' ? '检测到 SeaTable 新版本，正在覆盖刷新' : '正在从 SeaTable 刷新';
+    statusEl.textContent = mode === '自动' ? '检测到 SeaTable 新版本，正在同步' : '正在从 SeaTable 刷新';
     const response = await fetch('/api/refresh', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: '{}',
+      body: JSON.stringify({ force: true }),
     });
     const result = await response.json();
     if (!response.ok || !result.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    const payload = result.payload as FollowupPayload;
+    if (!payload) throw new Error('刷新结果缺少 payload');
     const counts = result.counts || {};
-    summaryEl.textContent = `SeaTable 已刷新 · 患者 ${counts.patients || 0} · 药敏 ${counts.drugs || 0} · 随访 ${counts.followups || 0}`;
-    statusEl.textContent = '刷新完成，正在重载';
-    window.setTimeout(() => window.location.reload(), 500);
+    isRefreshing = false;
+    mountWorkbook(payload, `SeaTable 已同步 · 患者 ${counts.patients || 0} · 药敏 ${counts.drugs || 0} · 随访 ${counts.followups || 0}`);
   } catch (error) {
     isRefreshing = false;
     statusEl.textContent = '刷新失败';
     summaryEl.textContent = error instanceof Error ? error.message : String(error);
+    if (mode === '手动') refreshSyncEl.disabled = false;
+  } finally {
     if (mode === '手动') refreshSyncEl.disabled = false;
   }
 }
@@ -1331,7 +1371,8 @@ function startRealtimeSync() {
     statusEl.textContent = '摘要视图已加载，在列显示中切换到药敏明细后启用实时写回';
     return;
   }
-  window.setTimeout(async () => {
+  stopRealtimeSync();
+  syncInitTimer = window.setTimeout(async () => {
     try {
       const snapshot = await workbookSnapshot(false);
       lastSavedWorkbookHash = workbookHash(snapshot);
@@ -1343,7 +1384,7 @@ function startRealtimeSync() {
     }
   }, 3000);
 
-  window.setInterval(async () => {
+  syncPollTimer = window.setInterval(async () => {
     if (isSaving || isRefreshing) return;
     try {
       const state = await pollRemoteState();
@@ -1353,9 +1394,9 @@ function startRealtimeSync() {
         lastRemoteSignature = signature;
         return;
       }
-      if (currentPayload && !hasRawTables(currentPayload)) {
-        lastRemoteSignature = signature;
-        statusEl.textContent = 'SeaTable 有更新，嵌套视图保持当前数据';
+      const snapshot = await workbookSnapshot(false);
+      if (workbookHash(snapshot) !== lastSavedWorkbookHash) {
+        statusEl.textContent = 'SeaTable 有更新，本地也有未保存修改';
         return;
       }
       await refreshFromSeaTable('自动');
@@ -1365,33 +1406,15 @@ function startRealtimeSync() {
   }, REMOTE_POLL_INTERVAL_MS);
 }
 
-async function boot() {
-  document.body.classList.add('sheet-mode');
-  document.querySelectorAll<HTMLElement>('.table-action').forEach((item) => {
-    item.hidden = false;
-  });
-  const openSheetEl = document.getElementById('openSheet');
-  if (openSheetEl) openSheetEl.hidden = true;
-  document.getElementById('app')!.innerHTML = '';
-  const payload: FollowupPayload = await fetch('/followup.json').then((response) => response.json());
-  currentPayload = payload;
-  summaryEl.hidden = false;
-  const metas = buildColumnMeta();
-  const hiddenCount = metas.filter((meta) => getHiddenColumnKeys().has(meta.key)).length;
-  if (hasRawTables(payload)) {
-    const rawRows = (payload.raw_tables || []).reduce((sum, table) => sum + (table.rows?.length || 0), 0);
-    summaryEl.textContent = `${payload.raw_tables?.length || 0} 张 SeaTable 表 · ${rawRows} 行`;
-    [
-      reloadEl,
-      columnPanelToggleEl,
-    ].forEach((item) => {
-      item.hidden = true;
-    });
-    columnPanelEl.hidden = true;
-  } else {
-    summaryEl.textContent = `${payload.patients.length} 位患者 · 药敏 ${payload.drug_sensitivity.length} 条 · 随访 ${payload.followups.length} 条 · ${expanded ? '药敏明细展开' : '药敏摘要视图'} · 隐藏 ${hiddenCount} 列`;
-    renderColumnPanel();
+function mountWorkbook(payload: FollowupPayload, status: string) {
+  stopRealtimeSync();
+  try {
+    currentUniver?.dispose?.();
+  } catch {
+    // Best effort: Univer 0.25 cleans most resources through dispose().
   }
+  document.getElementById('app')!.innerHTML = '';
+  updatePayloadSummary(payload);
 
   const univer = new Univer({
     locale: LocaleType.ZH_CN,
@@ -1429,11 +1452,23 @@ async function boot() {
   univer.registerPlugin(UniverSheetsTablePlugin);
 
   univer.createUnit(UniverInstanceType.UNIVER_SHEET, makeWorkbook(payload) as any);
+  currentUniver = univer;
   (window as any).univer = univer;
   (window as any).univerAPI = FUniver.newAPI(univer);
   registerContextMenuActions();
-  statusEl.textContent = '已加载，双击或输入可编辑';
+  statusEl.textContent = status;
   startRealtimeSync();
+}
+
+async function boot() {
+  document.body.classList.add('sheet-mode');
+  document.querySelectorAll<HTMLElement>('.table-action').forEach((item) => {
+    item.hidden = false;
+  });
+  const openSheetEl = document.getElementById('openSheet');
+  if (openSheetEl) openSheetEl.hidden = true;
+  const payload: FollowupPayload = await fetch('/followup.json').then((response) => response.json());
+  mountWorkbook(payload, '已加载，双击或输入可编辑');
 }
 
 saveSyncEl.addEventListener('click', async () => {

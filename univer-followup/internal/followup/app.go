@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -169,16 +170,21 @@ func (a *app) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, apiError{OK: false, Error: "method not allowed"})
 		return
 	}
-	if payload, ok := a.currentStructuredPayload(); ok {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "payload": payload, "counts": payloadCounts(payload), "preserved": true})
-		return
+	var req map[string]any
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	force, _ := req["force"].(bool)
+	if !force {
+		if payload, ok := a.currentStructuredPayload(); ok {
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "payload": payload, "counts": payloadCounts(payload), "preserved": true})
+			return
+		}
 	}
 	payload, err := a.refreshFromSeaTable()
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, apiError{OK: false, Error: err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "payload": payload, "counts": payloadCounts(payload)})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "payload": payload, "counts": payloadCounts(payload), "preserved": false})
 }
 
 func (a *app) handleSave(w http.ResponseWriter, r *http.Request) {
@@ -1189,6 +1195,98 @@ func (a *app) syncRawTablesToSeaTable(token string, meta map[string]any, payload
 	return updatedTables, updatedRows, deletedRows, nil
 }
 
+var (
+	assayIC50Pattern       = regexp.MustCompile(`(?i)IC50\s*=\s*([^;；,)]+)`)
+	assayInhibitionPattern = regexp.MustCompile(`抑制率\s*=\s*([0-9.Ee+\-]+%?)`)
+	assayPairPattern       = regexp.MustCompile(`\(([^,，)]+)[,，]\s*([0-9.Ee+\-]+%?)\)`)
+	followupHeaders        = []string{"4-17随访", "4-3随访", "3-24/25随访"}
+)
+
+func patientID(row map[string]any) string {
+	return firstNonEmpty(
+		cellString(row["patient_id"]),
+		cellString(row["类器官样本号"]),
+		cellString(row["样本号"]),
+	)
+}
+
+func sourceRow(row map[string]any, index int) string {
+	return firstNonEmpty(
+		cellString(row["source_row"]),
+		cellString(row["序号"]),
+		strconv.Itoa(index+2),
+	)
+}
+
+func parseAssayRaw(raw string) (string, string) {
+	ic50 := ""
+	inhibition := ""
+	if match := assayIC50Pattern.FindStringSubmatch(raw); len(match) > 1 {
+		ic50 = strings.TrimSpace(match[1])
+	}
+	if match := assayInhibitionPattern.FindStringSubmatch(raw); len(match) > 1 {
+		inhibition = strings.TrimSpace(match[1])
+	}
+	if ic50 == "" || inhibition == "" {
+		if match := assayPairPattern.FindStringSubmatch(raw); len(match) > 2 {
+			if ic50 == "" {
+				ic50 = strings.TrimSpace(match[1])
+			}
+			if inhibition == "" {
+				inhibition = strings.TrimSpace(match[2])
+			}
+		}
+	}
+	return ic50, inhibition
+}
+
+func deriveStructuredChildren(patients []map[string]any, headers []string) ([]map[string]any, []map[string]any) {
+	var drugs []map[string]any
+	var followups []map[string]any
+	for index, patient := range patients {
+		id := patientID(patient)
+		if id == "" {
+			continue
+		}
+		patient["patient_id"] = id
+		if cellString(patient["类器官样本号"]) == "" {
+			patient["类器官样本号"] = id
+		}
+		row := sourceRow(patient, index)
+		for _, header := range headers {
+			if !strings.HasPrefix(header, "药敏_") {
+				continue
+			}
+			raw := cellString(patient[header])
+			if raw == "" {
+				continue
+			}
+			ic50, inhibition := parseAssayRaw(raw)
+			drugs = append(drugs, map[string]any{
+				"patient_id": id,
+				"source_row": row,
+				"药物组合":       strings.TrimPrefix(header, "药敏_"),
+				"IC50":       ic50,
+				"抑制率":        inhibition,
+				"原始值":        raw,
+			})
+		}
+		for _, header := range followupHeaders {
+			content := cellString(patient[header])
+			if content == "" {
+				continue
+			}
+			followups = append(followups, map[string]any{
+				"patient_id": id,
+				"source_row": row,
+				"随访节点":       header,
+				"内容":         content,
+			})
+		}
+	}
+	return drugs, followups
+}
+
 func (a *app) refreshFromSeaTable() (map[string]any, error) {
 	token, err := a.seatableAccessToken()
 	if err != nil {
@@ -1211,28 +1309,14 @@ func (a *app) refreshFromSeaTable() (map[string]any, error) {
 	if names["followup"] != "" {
 		followups, _ = a.namedRows(token, meta, names["followup"])
 	}
-	rawTables := []map[string]any{}
-	for _, table := range asRows(meta["tables"]) {
-		tableName, _ := table["name"].(string)
-		if tableName == "" {
-			continue
+	if len(drugs) == 0 || len(followups) == 0 {
+		derivedDrugs, derivedFollowups := deriveStructuredChildren(patients, a.xlsxHeaders)
+		if len(drugs) == 0 {
+			drugs = derivedDrugs
 		}
-		var columns []string
-		for _, column := range tableColumnDefs(meta, tableName) {
-			if name, _ := column["name"].(string); name != "" {
-				columns = append(columns, name)
-			}
+		if len(followups) == 0 {
+			followups = derivedFollowups
 		}
-		rows, err := a.namedRows(token, meta, tableName)
-		if err != nil {
-			return nil, err
-		}
-		sortRows(rows)
-		rawTables = append(rawTables, map[string]any{
-			"name":    tableName,
-			"columns": columns,
-			"rows":    rows,
-		})
 	}
 	for _, row := range append(append(patients, drugs...), followups...) {
 		delete(row, "_id")
@@ -1247,7 +1331,6 @@ func (a *app) refreshFromSeaTable() (map[string]any, error) {
 		"patients":         patients,
 		"drug_sensitivity": drugs,
 		"followups":        followups,
-		"raw_tables":       rawTables,
 	}
 	_, err = a.savePayload(payload, nil)
 	return payload, err
@@ -1260,6 +1343,13 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func cellString(value any) string {
+	if value == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(value))
 }
 
 func sortRows(rows []map[string]any) {
