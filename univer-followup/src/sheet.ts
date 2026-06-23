@@ -11,6 +11,8 @@ import { UniverSheetsFilterPlugin } from '@univerjs/sheets-filter';
 import { UniverSheetsFilterUIPlugin } from '@univerjs/sheets-filter-ui';
 import SheetsFilterUIZhCN from '@univerjs/sheets-filter-ui/locale/zh-CN';
 import { UniverSheetsFormulaPlugin } from '@univerjs/sheets-formula';
+import { UniverSheetsFormulaUIPlugin } from '@univerjs/sheets-formula-ui';
+import SheetsFormulaUIZhCN from '@univerjs/sheets-formula-ui/locale/zh-CN';
 import SheetsZhCN from '@univerjs/sheets/locale/zh-CN';
 import { UniverSheetsNumfmtPlugin } from '@univerjs/sheets-numfmt';
 import { UniverSheetsSortPlugin } from '@univerjs/sheets-sort';
@@ -27,6 +29,7 @@ import '@univerjs/ui/lib/index.css';
 import '@univerjs/docs-ui/lib/index.css';
 import '@univerjs/sheets-ui/lib/index.css';
 import '@univerjs/sheets-filter-ui/lib/index.css';
+import '@univerjs/sheets-formula-ui/lib/index.css';
 import '@univerjs/sheets-sort-ui/lib/index.css';
 import '@univerjs/sheets/facade';
 import '@univerjs/ui/facade';
@@ -1400,6 +1403,7 @@ async function boot() {
         SheetsZhCN,
         SheetsUIZhCN,
         SheetsFilterUIZhCN,
+        SheetsFormulaUIZhCN,
         SheetsSortUIZhCN,
       ),
     },
@@ -1419,6 +1423,7 @@ async function boot() {
   univer.registerPlugin(UniverSheetsFilterPlugin);
   univer.registerPlugin(UniverSheetsFilterUIPlugin);
   univer.registerPlugin(UniverSheetsFormulaPlugin);
+  univer.registerPlugin(UniverSheetsFormulaUIPlugin);
   univer.registerPlugin(UniverSheetsSortPlugin);
   univer.registerPlugin(UniverSheetsSortUIPlugin);
   univer.registerPlugin(UniverSheetsTablePlugin);
