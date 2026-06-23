@@ -220,7 +220,7 @@ func decodeSaveRequest(body io.Reader) (saveRequest, error) {
 	if !ok {
 		return saveRequest{}, errors.New("payload 必须是对象")
 	}
-	rawMode := len(asAnySlice(payload["changed_raw_tables"])) > 0
+	rawMode := asRows(payload["raw_tables"]) != nil
 	if err := validatePayload(payload, rawMode); err != nil {
 		return saveRequest{}, err
 	}
@@ -767,6 +767,19 @@ func (a *app) upsertRow(token, tableName, rowID string, row map[string]any) erro
 	return err
 }
 
+func (a *app) deleteRow(token, tableName, rowID string) error {
+	if strings.TrimSpace(rowID) == "" {
+		return nil
+	}
+	uuid, err := a.seatableBaseUUID()
+	if err != nil {
+		return err
+	}
+	payload := map[string]any{"table_name": tableName, "row_id": rowID}
+	_, err = a.seatableAPI("/api/v1/dtables/"+uuid+"/rows/", http.MethodDelete, payload, token, true)
+	return err
+}
+
 func compactRow(row map[string]any, columns map[string]string) map[string]any {
 	out := map[string]any{}
 	for key, value := range row {
@@ -790,6 +803,12 @@ func existingRowID(rows map[string]map[string]any, key string) string {
 		return ""
 	}
 	return fmt.Sprint(row["_id"])
+}
+
+func markPresent(keys map[string]bool, key string) {
+	if strings.TrimSpace(key) != "" {
+		keys[key] = true
+	}
 }
 
 func (a *app) snapshotSeaTableState(token string, meta map[string]any) {
@@ -816,7 +835,7 @@ func (a *app) snapshotSeaTableState(token string, meta map[string]any) {
 
 func validatePayload(payload map[string]any, rawMode bool) error {
 	if rawMode {
-		if asRows(payload["raw_tables"]) == nil {
+		if payload["raw_tables"] == nil || asRows(payload["raw_tables"]) == nil {
 			return errors.New("payload.raw_tables 必须是数组")
 		}
 		return nil
@@ -845,7 +864,7 @@ func validatePayload(payload map[string]any, rawMode bool) error {
 }
 
 func (a *app) syncToSeaTable(payload map[string]any) (map[string]any, error) {
-	rawMode := len(asAnySlice(payload["changed_raw_tables"])) > 0
+	rawMode := asRows(payload["raw_tables"]) != nil
 	if err := validatePayload(payload, rawMode); err != nil {
 		return nil, err
 	}
@@ -862,17 +881,18 @@ func (a *app) syncToSeaTable(payload map[string]any) (map[string]any, error) {
 	drugTable := names["drug"]
 	followupTable := names["followup"]
 	a.snapshotSeaTableState(token, meta)
-	rawTables, rawUpdatedRows, err := a.syncRawTablesToSeaTable(token, meta, payload)
+	rawTables, rawUpdatedRows, rawDeletedRows, err := a.syncRawTablesToSeaTable(token, meta, payload)
 	if err != nil {
 		return nil, err
 	}
 	if rawMode {
 		state, _ := a.remoteState()
 		return map[string]any{
-			"ok":         true,
-			"raw_tables": rawTables,
-			"raw_rows":   rawUpdatedRows,
-			"state":      state,
+			"ok":               true,
+			"raw_tables":       rawTables,
+			"raw_rows":         rawUpdatedRows,
+			"deleted_raw_rows": rawDeletedRows,
+			"state":            state,
 		}, nil
 	}
 	patientColumns := tableColumns(meta, primaryTable)
@@ -892,9 +912,11 @@ func (a *app) syncToSeaTable(payload map[string]any) (map[string]any, error) {
 			rows[id] = row
 		}
 	}
-	updatedPatients, skippedPatients, skipped := 0, 0, 0
+	seenPatients := map[string]bool{}
+	updatedPatients, deletedPatients, skippedPatients, skipped := 0, 0, 0, 0
 	for _, patient := range asRows(payload["patients"]) {
 		patientID := fmt.Sprint(patient["patient_id"])
+		markPresent(seenPatients, patientID)
 		rowID := ""
 		if row := rows[patientID]; row != nil {
 			rowID = fmt.Sprint(row["_id"])
@@ -918,6 +940,15 @@ func (a *app) syncToSeaTable(payload map[string]any) (map[string]any, error) {
 		}
 		updatedPatients++
 	}
+	for patientID, row := range rows {
+		if seenPatients[patientID] {
+			continue
+		}
+		if err := a.deleteRow(token, primaryTable, fmt.Sprint(row["_id"])); err != nil {
+			return nil, err
+		}
+		deletedPatients++
+	}
 	existingDrugs := map[string]map[string]any{}
 	if drugTable != "" {
 		rows, _ := a.namedRows(token, meta, drugTable)
@@ -926,7 +957,8 @@ func (a *app) syncToSeaTable(payload map[string]any) (map[string]any, error) {
 			existingDrugs[key] = row
 		}
 	}
-	updatedDrugs := 0
+	seenDrugs := map[string]bool{}
+	updatedDrugs, deletedDrugs := 0, 0
 	for _, drug := range asRows(payload["drug_sensitivity"]) {
 		if drugTable == "" {
 			skipped++
@@ -939,6 +971,7 @@ func (a *app) syncToSeaTable(payload map[string]any) (map[string]any, error) {
 			continue
 		}
 		key := patientID + "\x00" + drugName
+		seenDrugs[key] = true
 		rowID := existingRowID(existingDrugs, key)
 		patch := compactRow(drug, drugColumns)
 		if _, ok := drugColumns["原始值"]; ok && fmt.Sprint(patch["原始值"]) == "" {
@@ -949,6 +982,17 @@ func (a *app) syncToSeaTable(payload map[string]any) (map[string]any, error) {
 		}
 		updatedDrugs++
 	}
+	if drugTable != "" {
+		for key := range existingDrugs {
+			if seenDrugs[key] {
+				continue
+			}
+			if err := a.deleteRow(token, drugTable, existingRowID(existingDrugs, key)); err != nil {
+				return nil, err
+			}
+			deletedDrugs++
+		}
+	}
 	existingFollowups := map[string]map[string]any{}
 	if followupTable != "" {
 		rows, _ := a.namedRows(token, meta, followupTable)
@@ -957,7 +1001,8 @@ func (a *app) syncToSeaTable(payload map[string]any) (map[string]any, error) {
 			existingFollowups[key] = row
 		}
 	}
-	updatedFollowups := 0
+	seenFollowups := map[string]bool{}
+	updatedFollowups, deletedFollowups := 0, 0
 	for _, followup := range asRows(payload["followups"]) {
 		if followupTable == "" {
 			skipped++
@@ -968,6 +1013,7 @@ func (a *app) syncToSeaTable(payload map[string]any) (map[string]any, error) {
 			skipped++
 			continue
 		}
+		seenFollowups[key] = true
 		rowID := existingRowID(existingFollowups, key)
 		patch := compactRow(followup, followupColumns)
 		if err := a.upsertRow(token, followupTable, rowID, patch); err != nil {
@@ -975,21 +1021,36 @@ func (a *app) syncToSeaTable(payload map[string]any) (map[string]any, error) {
 		}
 		updatedFollowups++
 	}
+	if followupTable != "" {
+		for key := range existingFollowups {
+			if seenFollowups[key] {
+				continue
+			}
+			if err := a.deleteRow(token, followupTable, existingRowID(existingFollowups, key)); err != nil {
+				return nil, err
+			}
+			deletedFollowups++
+		}
+	}
 	state, _ := a.remoteState()
 	return map[string]any{
-		"ok":         true,
-		"updated":    updatedPatients,
-		"skipped":    skipped + skippedPatients,
-		"patients":   updatedPatients,
-		"drugs":      updatedDrugs,
-		"followups":  updatedFollowups,
-		"raw_tables": rawTables,
-		"raw_rows":   rawRows,
-		"state":      state,
+		"ok":                true,
+		"updated":           updatedPatients,
+		"skipped":           skipped + skippedPatients,
+		"patients":          updatedPatients,
+		"drugs":             updatedDrugs,
+		"followups":         updatedFollowups,
+		"deleted_patients":  deletedPatients,
+		"deleted_drugs":     deletedDrugs,
+		"deleted_followups": deletedFollowups,
+		"raw_tables":        rawTables,
+		"raw_rows":          rawUpdatedRows,
+		"deleted_raw_rows":  rawDeletedRows,
+		"state":             state,
 	}, nil
 }
 
-func (a *app) syncRawTablesToSeaTable(token string, meta map[string]any, payload map[string]any) (int, int, error) {
+func (a *app) syncRawTablesToSeaTable(token string, meta map[string]any, payload map[string]any) (int, int, int, error) {
 	changed := map[string]bool{}
 	for _, name := range asAnySlice(payload["changed_raw_tables"]) {
 		if s := strings.TrimSpace(fmt.Sprint(name)); s != "" {
@@ -997,7 +1058,7 @@ func (a *app) syncRawTablesToSeaTable(token string, meta map[string]any, payload
 		}
 	}
 	if len(changed) == 0 {
-		return 0, 0, nil
+		return 0, 0, 0, nil
 	}
 	tableExists := map[string]bool{}
 	for _, table := range asRows(meta["tables"]) {
@@ -1007,16 +1068,38 @@ func (a *app) syncRawTablesToSeaTable(token string, meta map[string]any, payload
 	}
 	updatedTables := 0
 	updatedRows := 0
+	deletedRows := 0
 	for _, rawTable := range asRows(payload["raw_tables"]) {
 		tableName := strings.TrimSpace(fmt.Sprint(rawTable["name"]))
 		if tableName == "" || !changed[tableName] {
 			continue
 		}
 		if !tableExists[tableName] {
-			return updatedTables, updatedRows, fmt.Errorf("SeaTable 表不存在: %s", tableName)
+			return updatedTables, updatedRows, deletedRows, fmt.Errorf("SeaTable 表不存在: %s", tableName)
 		}
 		columns := tableColumns(meta, tableName)
 		rows := asRows(rawTable["rows"])
+		submittedIDs := map[string]bool{}
+		for _, row := range rows {
+			rowID := strings.TrimSpace(fmt.Sprint(row["_id"]))
+			if rowID != "" {
+				submittedIDs[rowID] = true
+			}
+		}
+		currentRows, err := a.gatewayRows(token, tableName)
+		if err != nil {
+			return updatedTables, updatedRows, deletedRows, err
+		}
+		for _, row := range currentRows {
+			rowID := strings.TrimSpace(fmt.Sprint(row["_id"]))
+			if rowID == "" || submittedIDs[rowID] {
+				continue
+			}
+			if err := a.deleteRow(token, tableName, rowID); err != nil {
+				return updatedTables, updatedRows, deletedRows, err
+			}
+			deletedRows++
+		}
 		for _, row := range rows {
 			rowID := fmt.Sprint(row["_id"])
 			patch := compactRow(row, columns)
@@ -1024,13 +1107,13 @@ func (a *app) syncRawTablesToSeaTable(token string, meta map[string]any, payload
 				continue
 			}
 			if err := a.upsertRow(token, tableName, rowID, patch); err != nil {
-				return updatedTables, updatedRows, err
+				return updatedTables, updatedRows, deletedRows, err
 			}
 			updatedRows++
 		}
 		updatedTables++
 	}
-	return updatedTables, updatedRows, nil
+	return updatedTables, updatedRows, deletedRows, nil
 }
 
 func (a *app) refreshFromSeaTable() (map[string]any, error) {

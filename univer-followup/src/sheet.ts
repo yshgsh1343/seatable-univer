@@ -1308,10 +1308,13 @@ async function saveCurrentWorkbook(mode: '手动' | '自动', finishEditing: boo
     lastSavedWorkbookHash = hash;
     lastLocalSaveAt = Date.now();
     if (result.seatable?.state?.signature) lastRemoteSignature = result.seatable.state.signature;
+    const deletedStructured = (result.seatable?.deleted_patients || 0)
+      + (result.seatable?.deleted_drugs || 0)
+      + (result.seatable?.deleted_followups || 0);
     const seatableText = result.seatable?.ok && hasRawTables(payload)
-      ? `SeaTable 原表 ${result.seatable.raw_tables || 0} 张 · ${result.seatable.raw_rows || 0} 行`
+      ? `SeaTable 原表 ${result.seatable.raw_tables || 0} 张 · 更新 ${result.seatable.raw_rows || 0} 行 · 删除 ${result.seatable.deleted_raw_rows || 0} 行`
       : result.seatable?.ok
-      ? `SeaTable 主表 ${result.seatable.patients || result.seatable.updated || 0} · 药敏 ${result.seatable.drugs || 0} · 随访 ${result.seatable.followups || 0}`
+      ? `SeaTable 主表 ${result.seatable.patients || result.seatable.updated || 0} · 药敏 ${result.seatable.drugs || 0} · 随访 ${result.seatable.followups || 0} · 删除 ${deletedStructured}`
       : `SeaTable未写入: ${result.seatable?.error || '未配置'}`;
     syncSummary(payload, `${mode}保存 ${result.saved_at}`);
     statusEl.textContent = `${mode}保存完成 · ${seatableText}`;
