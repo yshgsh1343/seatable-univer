@@ -107,7 +107,7 @@ interface ColumnMeta {
   drugField?: string;
 }
 
-type ColumnGroup = 'basic' | 'clinical' | 'pathology' | 'molecular' | 'imaging' | 'drug' | 'followup';
+type ColumnGroup = 'basic' | 'clinical' | 'pathology' | 'ihc' | 'molecular' | 'imaging' | 'drug' | 'followup';
 interface DetailColumn {
   key: string;
   label: string;
@@ -124,6 +124,8 @@ const clinicalColumns: DetailColumn[] = [
 ];
 const pathologyColumns: DetailColumn[] = [
   { key: 'pathology-diagnosis', label: '病理诊断', sourceKey: '病理诊断结果', width: 160 },
+];
+const ihcColumns: DetailColumn[] = [
   { key: 'ihc-raw', label: '免疫组化原文', sourceKey: '免疫组化结果', width: 260 },
 ];
 const molecularColumns: DetailColumn[] = [
@@ -141,7 +143,7 @@ const molecularColumns: DetailColumn[] = [
 const imagingColumns: DetailColumn[] = [
   { key: 'imaging', label: '影像评估', sourceKey: '影像评估', width: 260 },
 ];
-const detailColumns = [...clinicalColumns, ...pathologyColumns, ...molecularColumns, ...imagingColumns];
+const detailColumns = [...clinicalColumns, ...pathologyColumns, ...ihcColumns, ...molecularColumns, ...imagingColumns];
 const globalColumns = ['随访条数', '随访摘要', '药敏结果原文'];
 const drugTypes = [
   '阿霉素',
@@ -184,19 +186,21 @@ const drugTypeColumns = [
 const groupLabels = {
   basic: '基本信息',
   clinical: '临床信息',
-  pathology: '病理/IHC',
+  pathology: '病理',
+  ihc: '组化',
   molecular: '分子标志',
   imaging: '影像评估',
   drug: '按药物类型',
   followup: '全局记录',
 } as const;
-const groupOrder: ColumnMeta['group'][] = ['basic', 'clinical', 'pathology', 'molecular', 'imaging', 'drug', 'followup'];
+const groupOrder: ColumnMeta['group'][] = ['basic', 'clinical', 'pathology', 'ihc', 'molecular', 'imaging', 'drug', 'followup'];
 const droppedXlsxHeaders = new Set(['序号']);
 
 const colors = {
   basic: '#DCEBFF',
   clinical: '#E0F2FE',
   pathology: '#FFE7C2',
+  ihc: '#FEF3C7',
   molecular: '#F3E8FF',
   imaging: '#E5E7EB',
   drug: '#DCFCE7',
@@ -238,12 +242,14 @@ function workbookHeaders(payload: FollowupPayload | null = currentPayload) {
 function groupForXlsxHeader(header: string): ColumnGroup {
   if (header.startsWith('药敏_')) return 'drug';
   if (header.startsWith('临床诊断_') || header.startsWith('病程_')) return 'clinical';
-  if (header.startsWith('病理诊断_') || header.startsWith('免疫组化_')) return 'pathology';
+  if (header.startsWith('病理诊断_')) return 'pathology';
+  if (header.startsWith('免疫组化_')) return 'ihc';
   if (header.startsWith('临床结局/疗效_') || header.includes('随访')) return 'followup';
   if (header.includes('分子分型')) return 'molecular';
   if (header.includes('MR/CT') || header.includes('影像')) return 'imaging';
   if (['临床诊断结果', '初治/复发', '如复发-->治疗史'].includes(header)) return 'clinical';
-  if (['病理诊断结果', '免疫组化结果'].includes(header)) return 'pathology';
+  if (header === '病理诊断结果') return 'pathology';
+  if (header === '免疫组化结果') return 'ihc';
   return 'basic';
 }
 
@@ -266,6 +272,7 @@ function buildColumnMeta() {
   baseColumns.forEach((label) => metas.push({ key: `basic.${slug(label)}`, label, group: 'basic', groupLabel: groupLabels.basic }));
   metas.push(...detailMeta('clinical', clinicalColumns));
   metas.push(...detailMeta('pathology', pathologyColumns));
+  metas.push(...detailMeta('ihc', ihcColumns));
   metas.push(...detailMeta('molecular', molecularColumns));
   metas.push(...detailMeta('imaging', imagingColumns));
   if (expanded) {
@@ -348,6 +355,12 @@ function setVisibleColumnGroups(groups: ColumnGroup[]) {
   reloadForColumns();
 }
 
+function restoreDefaultColumns() {
+  localStorage.removeItem(HIDDEN_COLUMNS_KEY);
+  localStorage.removeItem('drug_columns_collapsed');
+  reloadForColumns();
+}
+
 function renderColumnPanel() {
   const metas = buildColumnMeta();
   const hidden = getHiddenColumnKeys();
@@ -415,6 +428,7 @@ function renderColumnPanel() {
       </div>
       <div class="column-panel-tools">
         <button type="button" data-column-action="apply">应用</button>
+        <button type="button" data-column-action="restore-default">恢复默认</button>
         <button type="button" data-column-action="show-all">全部显示</button>
         <button type="button" data-column-action="only-basic">仅基本</button>
         <button type="button" data-column-action="basic-drug">基本+药敏</button>
@@ -630,6 +644,7 @@ function payloadFromSnapshot(snapshot: any, original: FollowupPayload): Followup
     ] = baseValues;
     col = applyDetailSnapshot(patient, clinicalColumns, cells, row, col);
     col = applyDetailSnapshot(patient, pathologyColumns, cells, row, col);
+    col = applyDetailSnapshot(patient, ihcColumns, cells, row, col);
     col = applyDetailSnapshot(patient, molecularColumns, cells, row, col);
     col = applyDetailSnapshot(patient, imagingColumns, cells, row, col);
 
@@ -702,6 +717,7 @@ const groupStyle: Record<ColumnGroup, string> = {
   basic: 'groupBasic',
   clinical: 'groupClinical',
   pathology: 'groupPathology',
+  ihc: 'groupIhc',
   molecular: 'groupMolecular',
   imaging: 'groupImaging',
   drug: 'groupDrug',
@@ -893,6 +909,7 @@ function makeXlsxWorkbook(payload: FollowupPayload) {
       groupBasic: { bg: { rgb: colors.basic }, bl: 1, ht: 2, vt: 2, fs: 12 },
       groupClinical: { bg: { rgb: colors.clinical }, bl: 1, ht: 2, vt: 2, fs: 12 },
       groupPathology: { bg: { rgb: colors.pathology }, bl: 1, ht: 2, vt: 2, fs: 12 },
+      groupIhc: { bg: { rgb: colors.ihc }, bl: 1, ht: 2, vt: 2, fs: 12 },
       groupMolecular: { bg: { rgb: colors.molecular }, bl: 1, ht: 2, vt: 2, fs: 12 },
       groupImaging: { bg: { rgb: colors.imaging }, bl: 1, ht: 2, vt: 2, fs: 12 },
       groupDrug: { bg: { rgb: colors.drug }, bl: 1, ht: 2, vt: 2, fs: 12 },
@@ -948,6 +965,7 @@ function makeWorkbook(payload: FollowupPayload) {
   col += baseColumns.length;
   col = putDetailHeader(cells, merges, col, 'clinical', clinicalColumns);
   col = putDetailHeader(cells, merges, col, 'pathology', pathologyColumns);
+  col = putDetailHeader(cells, merges, col, 'ihc', ihcColumns);
   col = putDetailHeader(cells, merges, col, 'molecular', molecularColumns);
   col = putDetailHeader(cells, merges, col, 'imaging', imagingColumns);
 
@@ -1018,6 +1036,7 @@ function makeWorkbook(payload: FollowupPayload) {
     base.forEach((value) => put(cells, row, dataCol++, value || '', 'body'));
     dataCol = putDetailRow(cells, row, dataCol, patient, clinicalColumns);
     dataCol = putDetailRow(cells, row, dataCol, patient, pathologyColumns);
+    dataCol = putDetailRow(cells, row, dataCol, patient, ihcColumns);
     dataCol = putDetailRow(cells, row, dataCol, patient, molecularColumns);
     dataCol = putDetailRow(cells, row, dataCol, patient, imagingColumns);
 
@@ -1051,6 +1070,7 @@ function makeWorkbook(payload: FollowupPayload) {
       groupBasic: { bg: { rgb: colors.basic }, bl: 1, ht: 2, vt: 2, fs: 12 },
       groupClinical: { bg: { rgb: colors.clinical }, bl: 1, ht: 2, vt: 2, fs: 12 },
       groupPathology: { bg: { rgb: colors.pathology }, bl: 1, ht: 2, vt: 2, fs: 12 },
+      groupIhc: { bg: { rgb: colors.ihc }, bl: 1, ht: 2, vt: 2, fs: 12 },
       groupMolecular: { bg: { rgb: colors.molecular }, bl: 1, ht: 2, vt: 2, fs: 12 },
       groupImaging: { bg: { rgb: colors.imaging }, bl: 1, ht: 2, vt: 2, fs: 12 },
       groupDrug: { bg: { rgb: colors.drug }, bl: 1, ht: 2, vt: 2, fs: 12 },
@@ -1522,6 +1542,10 @@ columnPanelEl.addEventListener('click', (event) => {
 
   if (action === 'apply') {
     reloadForColumns();
+    return;
+  }
+  if (action === 'restore-default') {
+    restoreDefaultColumns();
     return;
   }
   if (action === 'close') {
