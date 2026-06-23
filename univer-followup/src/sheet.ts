@@ -1143,6 +1143,53 @@ function removeFallbackEditor() {
   document.querySelector('.cell-edit-fallback')?.remove();
 }
 
+function fallbackCellRect(event: MouseEvent, workbook: any, rangeInfo: any) {
+  const canvas = document.querySelector('canvas[data-u-comp="render-canvas"]') as HTMLCanvasElement | null;
+  const canvasRect = canvas?.getBoundingClientRect();
+  const snapshot = workbook.save?.();
+  const sheet = snapshot?.sheets?.[rangeInfo.sheetId] || Object.values(snapshot?.sheets || {})[0] as any;
+  const columnData = sheet?.columnData || {};
+  const rowData = sheet?.rowData || {};
+  const defaultColumnWidth = Number(sheet?.defaultColumnWidth || 120);
+  const defaultRowHeight = Number(sheet?.defaultRowHeight || 28);
+  const rowHeaderWidth = 96;
+
+  const columnWidth = (col: number) => {
+    const data = columnData[col] || {};
+    if (data.hd) return 0;
+    return Number(data.w || defaultColumnWidth);
+  };
+  const rowHeight = (row: number) => Number(rowData[row]?.h || defaultRowHeight);
+
+  const width = Math.max(columnWidth(rangeInfo.startColumn), 72);
+  const height = Math.max(rowHeight(rangeInfo.startRow), 30);
+  let left = event.clientX - width / 2;
+  let top = event.clientY - height / 2;
+
+  if (canvasRect) {
+    const sheetLeft = canvasRect.left + rowHeaderWidth;
+    const modelLeft = Array.from({ length: rangeInfo.startColumn }, (_, index) => columnWidth(index)).reduce((sum, value) => sum + value, 0);
+    const modelTop = Array.from({ length: rangeInfo.startRow }, (_, index) => rowHeight(index)).reduce((sum, value) => sum + value, 0);
+    const candidateLeft = sheetLeft + modelLeft;
+    const candidateTop = canvasRect.top + modelTop;
+    const eventInsideCandidate = event.clientX >= candidateLeft - 4
+      && event.clientX <= candidateLeft + width + 4
+      && event.clientY >= candidateTop - 4
+      && event.clientY <= candidateTop + height + 4;
+    if (eventInsideCandidate) {
+      left = candidateLeft;
+      top = candidateTop;
+    }
+  }
+
+  return {
+    left: Math.max(8, Math.min(left, window.innerWidth - width - 8)),
+    top: Math.max(8, Math.min(top, window.innerHeight - height - 8)),
+    width,
+    height,
+  };
+}
+
 function openFallbackCellEditor(event: MouseEvent) {
   const workbook = activeWorkbook();
   const worksheet = workbook?.getActiveSheet?.();
@@ -1158,8 +1205,11 @@ function openFallbackCellEditor(event: MouseEvent) {
   const editor = document.createElement('textarea');
   editor.className = 'cell-edit-fallback';
   editor.value = initialValue;
-  editor.style.left = `${Math.min(event.clientX, window.innerWidth - 360)}px`;
-  editor.style.top = `${Math.min(event.clientY, window.innerHeight - 90)}px`;
+  const rect = fallbackCellRect(event, workbook, rangeInfo);
+  editor.style.left = `${rect.left}px`;
+  editor.style.top = `${rect.top}px`;
+  editor.style.width = `${rect.width}px`;
+  editor.style.height = `${rect.height}px`;
   document.body.appendChild(editor);
   editor.focus();
   editor.select();
