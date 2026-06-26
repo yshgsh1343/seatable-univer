@@ -437,34 +437,43 @@ function customGroupsTemplate(metas = buildColumnMeta()) {
   };
 }
 
+function columnAddress(index: number) {
+  let value = index + 1;
+  let label = '';
+  while (value > 0) {
+    value -= 1;
+    label = String.fromCharCode(65 + (value % 26)) + label;
+    value = Math.floor(value / 26);
+  }
+  return label;
+}
+
 function renderCustomGroupColumnPicker(group: CustomColumnGroup, metas: ColumnMeta[]) {
   const selectedKeys = customGroupColumnKeys(group, metas);
-  return groupOrder.map((columnGroup) => {
-    const groupMetas = metas.filter((meta) => meta.group === columnGroup);
-    const selectedCount = groupMetas.filter((meta) => selectedKeys.has(meta.key)).length;
-    const columnItems = groupMetas.map((meta) => `
-      <label class="custom-group-column-option" title="${escapeHtml(meta.label)}">
-        <input
-          type="checkbox"
-          data-custom-column-label="${escapeHtml(meta.label)}"
-          ${selectedKeys.has(meta.key) ? 'checked' : ''}
-        />
-        <span>${escapeHtml(meta.label)}</span>
-      </label>
-    `).join('');
-    return `
-      <section class="custom-group-column-section">
-        <div class="custom-group-column-section-head">
-          <label>
-            <input type="checkbox" data-custom-section-toggle="${columnGroup}" />
-            <span>${groupLabels[columnGroup]}</span>
-          </label>
-          <span class="custom-group-column-count">${selectedCount}/${groupMetas.length}</span>
-        </div>
-        <div class="custom-group-column-options">${columnItems}</div>
-      </section>
-    `;
-  }).join('');
+  const selectedCount = metas.filter((meta) => selectedKeys.has(meta.key)).length;
+  const columnItems = metas.map((meta, index) => `
+    <label class="custom-group-column-option" title="${escapeHtml(columnAddress(index))} ${escapeHtml(meta.label)}">
+      <input
+        type="checkbox"
+        data-custom-column-label="${escapeHtml(meta.label)}"
+        ${selectedKeys.has(meta.key) ? 'checked' : ''}
+      />
+      <span class="custom-group-column-address">${columnAddress(index)}</span>
+      <span class="custom-group-column-label">${escapeHtml(meta.label)}</span>
+    </label>
+  `).join('');
+  return `
+    <section class="custom-group-column-section">
+      <div class="custom-group-column-section-head">
+        <label>
+          <input type="checkbox" data-custom-section-toggle="all-table-columns" />
+          <span>表格列</span>
+        </label>
+        <span class="custom-group-column-count">${selectedCount}/${metas.length}</span>
+      </div>
+      <div class="custom-group-column-options">${columnItems}</div>
+    </section>
+  `;
 }
 
 function reloadForColumns() {
@@ -536,7 +545,7 @@ function renderCustomColumnGroups(metas: ColumnMeta[], hidden: Set<string>) {
   const editor = customColumnGroupEditorOpen ? `
     <div class="custom-column-editor">
       <div class="custom-group-form-head">
-        <span>勾选列来定义分组</span>
+        <span>勾选表格列来定义分组</span>
         <div class="custom-column-editor-actions">
           <button type="button" data-column-action="custom-add">新增分组</button>
           <button type="button" data-column-action="custom-save-form">保存分组</button>

@@ -397,7 +397,15 @@ button:hover {
   font-size: 12px;
 }
 
-.custom-group-column-option span {
+.custom-group-column-address {
+  flex: 0 0 28px;
+  color: #64748b;
+  font-weight: 700;
+  text-align: right;
+}
+
+.custom-group-column-label {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
