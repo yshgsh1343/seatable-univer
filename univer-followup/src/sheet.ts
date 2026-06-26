@@ -475,17 +475,24 @@ function renderCustomColumnGroups(metas: ColumnMeta[], hidden: Set<string>) {
     const keys = customGroupColumnKeys(group, metas);
     const groupMetas = metas.filter((meta) => keys.has(meta.key));
     const visibleCount = groupMetas.filter((meta) => !hidden.has(meta.key)).length;
+    const allVisible = groupMetas.length > 0 && visibleCount === groupMetas.length;
     const columnNames = groupMetas.slice(0, 8).map((meta) => meta.label).join('、');
     return `
       <section class="custom-column-group">
         <div class="custom-column-group-head">
           <div>
-            <div class="custom-column-group-name">${escapeHtml(group.name)}</div>
+            <label class="custom-column-group-label">
+              <input
+                type="checkbox"
+                data-custom-group-toggle="${index}"
+                ${allVisible ? 'checked' : ''}
+                ${groupMetas.length ? '' : 'disabled'}
+              />
+              <span class="custom-column-group-name">${escapeHtml(group.name)}</span>
+            </label>
             <div class="custom-column-group-summary">${visibleCount}/${groupMetas.length} 列${columnNames ? ` · ${escapeHtml(columnNames)}` : ''}</div>
           </div>
           <div class="custom-column-group-actions">
-            <button type="button" data-column-action="custom-show" data-custom-group-index="${index}">显示</button>
-            <button type="button" data-column-action="custom-hide" data-custom-group-index="${index}">折叠</button>
             <button type="button" data-column-action="custom-only" data-custom-group-index="${index}">仅此组</button>
           </div>
         </div>
@@ -552,6 +559,17 @@ function renderColumnPanel() {
   const drugModeAction = workbookHeaders().length ? '' : `
         <button type="button" data-column-action="toggle-drug-detail">${expanded ? '药敏摘要' : '药敏明细'}</button>
   `;
+  const groupShortcutHtml = groupOrder.map((group) => {
+    const groupMetas = metas.filter((meta) => meta.group === group);
+    const visibleCount = groupMetas.filter((meta) => !hidden.has(meta.key)).length;
+    const allVisible = groupMetas.length > 0 && visibleCount === groupMetas.length;
+    return `
+        <label class="column-shortcut" title="${escapeHtml(groupLabels[group])}">
+          <input type="checkbox" data-column-shortcut-group="${group}" ${allVisible ? 'checked' : ''} />
+          <span>${groupLabels[group]}</span>
+        </label>
+    `;
+  }).join('');
   const groupHtml = groupOrder.map((group) => {
     const groupMetas = metas.filter((meta) => meta.group === group);
     const visibleCount = groupMetas.filter((meta) => !hidden.has(meta.key)).length;
@@ -614,9 +632,7 @@ function renderColumnPanel() {
         <button type="button" data-column-action="apply">应用</button>
         <button type="button" data-column-action="restore-default">恢复默认</button>
         <button type="button" data-column-action="show-all">全部显示</button>
-        <button type="button" data-column-action="only-basic">仅基本</button>
-        <button type="button" data-column-action="basic-drug">基本+药敏</button>
-        <button type="button" data-column-action="basic-followup">基本+随访</button>
+        ${groupShortcutHtml}
         ${drugModeAction}
         <button type="button" data-column-action="close">关闭</button>
       </div>
@@ -1754,6 +1770,19 @@ columnPanelEl.addEventListener('change', (event) => {
     return;
   }
 
+  const shortcutGroup = input.dataset.columnShortcutGroup as ColumnMeta['group'] | undefined;
+  if (shortcutGroup) {
+    metas.filter((meta) => meta.group === shortcutGroup).forEach((meta) => {
+      if (input.checked) hidden.delete(meta.key);
+      else hidden.add(meta.key);
+    });
+    setHiddenColumnKeys(hidden);
+    renderColumnPanel();
+    columnPanelEl.classList.remove('hidden');
+    statusEl.textContent = '列设置已修改';
+    return;
+  }
+
   const drugName = input.dataset.drugName;
   if (drugName) {
     metas.filter((meta) => meta.drugName === drugName).forEach((meta) => {
@@ -1904,6 +1933,28 @@ customGroupPanelEl.addEventListener('click', (event) => {
   });
 });
 
+customGroupPanelEl.addEventListener('change', (event) => {
+  const input = event.target instanceof HTMLInputElement ? event.target : null;
+  if (!input || input.dataset.customGroupToggle === undefined) return;
+  const index = Number(input.dataset.customGroupToggle);
+  const group = customColumnGroups.groups[index];
+  if (!group) return;
+  const keys = customGroupColumnKeys(group);
+  if (!keys.size) {
+    statusEl.textContent = '自定义分组没有匹配列';
+    renderCustomGroupPanel();
+    customGroupPanelEl.classList.remove('hidden');
+    return;
+  }
+  const hidden = getHiddenColumnKeys();
+  keys.forEach((key) => {
+    if (input.checked) hidden.delete(key);
+    else hidden.add(key);
+  });
+  setHiddenColumnKeys(hidden);
+  reloadForColumns();
+});
+
 columnPanelEl.addEventListener('click', async (event) => {
   const button = event.target instanceof HTMLElement ? event.target.closest('button[data-column-action]') : null;
   if (!(button instanceof HTMLButtonElement)) return;
@@ -1924,18 +1975,6 @@ columnPanelEl.addEventListener('click', async (event) => {
   if (action === 'show-all') {
     setHiddenColumnKeys(new Set());
     reloadForColumns();
-    return;
-  }
-  if (action === 'only-basic') {
-    setVisibleColumnGroups(['basic']);
-    return;
-  }
-  if (action === 'basic-drug') {
-    setVisibleColumnGroups(['basic', 'drug']);
-    return;
-  }
-  if (action === 'basic-followup') {
-    setVisibleColumnGroups(['basic', 'followup']);
     return;
   }
   if (action === 'toggle-drug-detail') {
