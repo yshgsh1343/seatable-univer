@@ -95,6 +95,7 @@ let syncPollTimer: number | null = null;
 let syncAutoSaveTimer: number | null = null;
 let customColumnGroups: CustomColumnGroupConfig = { version: 1, groups: [] };
 let customColumnGroupEditorOpen = false;
+let lastCustomGroupMetas: ColumnMeta[] = [];
 
 const xlsxHeaders = xlsxHeaderTemplate as string[];
 const headerAliases: Record<string, string> = {
@@ -256,6 +257,33 @@ function detailMeta(group: ColumnGroup, columns: DetailColumn[]) {
   }));
 }
 
+function uniqueColumnKey(base: string, used: Set<string>, index: number) {
+  let key = base;
+  let suffix = 0;
+  while (used.has(key)) {
+    suffix += 1;
+    key = `${base}.${index}${suffix > 1 ? `-${suffix}` : ''}`;
+  }
+  used.add(key);
+  return key;
+}
+
+function xlsxColumnMetaFromHeaders(headers: string[]) {
+  const used = new Set<string>();
+  return headers.map((rawHeader, index) => {
+    const header = String(rawHeader || '').trim() || `第${columnAddress(index)}列`;
+    const group = groupForXlsxHeader(header);
+    return {
+      key: uniqueColumnKey(`xlsx.${slug(header)}`, used, index),
+      label: header,
+      group,
+      groupLabel: groupLabels[group],
+      sourceKey: header,
+      drugName: header.startsWith('药敏_') ? header.slice(3) : undefined,
+    };
+  });
+}
+
 function workbookHeaders(payload: FollowupPayload | null = currentPayload) {
   const headers = payload?.xlsx_headers;
   const sourceHeaders = Array.isArray(headers) && headers.length ? headers : xlsxHeaders;
@@ -279,17 +307,7 @@ function groupForXlsxHeader(header: string): ColumnGroup {
 function buildColumnMeta() {
   const headers = workbookHeaders();
   if (headers.length) {
-    return headers.map((header) => {
-      const group = groupForXlsxHeader(header);
-      return {
-        key: `xlsx.${slug(header)}`,
-        label: header,
-        group,
-        groupLabel: groupLabels[group],
-        sourceKey: header,
-        drugName: header.startsWith('药敏_') ? header.slice(3) : undefined,
-      };
-    });
+    return xlsxColumnMetaFromHeaders(headers);
   }
   const metas: ColumnMeta[] = [];
   baseColumns.forEach((label) => metas.push({ key: `basic.${slug(label)}`, label, group: 'basic', groupLabel: groupLabels.basic }));
@@ -318,6 +336,99 @@ function buildColumnMeta() {
   }
   globalColumns.forEach((label) => metas.push({ key: `followup.${slug(label)}`, label, group: 'followup', groupLabel: groupLabels.followup }));
   return metas;
+}
+
+function firstSnapshotSheet(snapshot: any) {
+  const sheets = snapshot?.sheets || {};
+  if (sheets['followup-sheet']) return sheets['followup-sheet'];
+  const orderedIds = Array.isArray(snapshot?.sheetOrder) ? snapshot.sheetOrder : [];
+  const orderedSheet = orderedIds.map((id: string) => sheets[id]).find(Boolean);
+  if (orderedSheet) return orderedSheet;
+  return Object.values(sheets)[0] || null;
+}
+
+function snapshotSheetColumnCount(sheet: any, fallbackLength = 0) {
+  let count = Math.max(Number(sheet?.columnCount) || 0, fallbackLength);
+  Object.values(sheet?.cellData || {}).forEach((row: any) => {
+    Object.keys(row || {}).forEach((column) => {
+      const index = Number(column);
+      if (Number.isFinite(index)) count = Math.max(count, index + 1);
+    });
+  });
+  return count;
+}
+
+function mergedHeaderCellText(sheet: any, rowIndex: number, columnIndex: number) {
+  const cells = sheet?.cellData || {};
+  const direct = cellText(cells[rowIndex]?.[columnIndex]);
+  if (direct) return direct;
+  const merge = (sheet?.mergeData || []).find((item: any) => (
+    item.startRow <= rowIndex
+    && item.endRow >= rowIndex
+    && item.startColumn <= columnIndex
+    && item.endColumn >= columnIndex
+  ));
+  return merge ? cellText(cells[merge.startRow]?.[merge.startColumn]) : '';
+}
+
+function rowFilledCellCount(sheet: any, rowIndex: number, columnCount: number) {
+  const scanColumns = snapshotSheetColumnCount(sheet, columnCount);
+  let count = 0;
+  for (let col = 0; col < scanColumns; col += 1) {
+    if (mergedHeaderCellText(sheet, rowIndex, col)) count += 1;
+  }
+  return count;
+}
+
+function sheetHeaderRowIndex(sheet: any) {
+  const preferredRow = currentPayload && hasRawTables(currentPayload) ? RAW_HEADER_ROWS - 1 : HEADER_ROWS - 1;
+  const columnCount = snapshotSheetColumnCount(sheet);
+  if (rowFilledCellCount(sheet, preferredRow, columnCount) > 0) return preferredRow;
+  const candidates = [preferredRow, 0, 1, 2].filter((row, index, rows) => row >= 0 && rows.indexOf(row) === index);
+  let bestRow = preferredRow;
+  let bestCount = -1;
+  candidates.forEach((row) => {
+    const count = rowFilledCellCount(sheet, row, columnCount);
+    if (count > bestCount) {
+      bestRow = row;
+      bestCount = count;
+    }
+  });
+  return bestCount > 0 ? bestRow : preferredRow;
+}
+
+function sheetHeadersFromSnapshot(snapshot: any, fallbackHeaders: string[] = []) {
+  const sheet = firstSnapshotSheet(snapshot);
+  if (!sheet) return [];
+  const rowIndex = sheetHeaderRowIndex(sheet);
+  const scanColumns = snapshotSheetColumnCount(sheet) || fallbackHeaders.length;
+  const headers: string[] = [];
+  for (let col = 0; col < scanColumns; col += 1) {
+    const header = mergedHeaderCellText(sheet, rowIndex, col) || fallbackHeaders[col] || `第${columnAddress(col)}列`;
+    headers.push(header);
+  }
+  return headers;
+}
+
+function sheetColumnMetaFromSnapshot(snapshot: any) {
+  const metas = xlsxColumnMetaFromHeaders(sheetHeadersFromSnapshot(snapshot));
+  return metas.filter((meta) => meta.label.trim());
+}
+
+function customGroupMetasForCurrentPanel() {
+  return lastCustomGroupMetas.length ? lastCustomGroupMetas : buildColumnMeta();
+}
+
+async function currentTableColumnMeta() {
+  const fallback = buildColumnMeta();
+  if (!currentPayload || hasRawTables(currentPayload) || !workbookHeaders(currentPayload).length) return fallback;
+  try {
+    const snapshot = await workbookSnapshot(false);
+    const metas = sheetColumnMetaFromSnapshot(snapshot);
+    return metas.length ? metas : fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 function markerText(patient: Patient, patterns: string[]) {
@@ -574,8 +685,10 @@ function renderCustomColumnGroups(metas: ColumnMeta[], hidden: Set<string>) {
   `;
 }
 
-function renderCustomGroupPanel() {
-  customGroupPanelEl.innerHTML = renderCustomColumnGroups(buildColumnMeta(), getHiddenColumnKeys());
+async function renderCustomGroupPanel() {
+  const metas = await currentTableColumnMeta();
+  lastCustomGroupMetas = metas;
+  customGroupPanelEl.innerHTML = renderCustomColumnGroups(metas, getHiddenColumnKeys());
   customGroupPanelEl.querySelectorAll<HTMLElement>('.custom-group-form-row').forEach(updateCustomGroupFormCounts);
 }
 
@@ -733,8 +846,9 @@ function applyXlsxAliases(patient: Patient) {
 }
 
 function payloadFromXlsxSnapshot(snapshot: any, original: FollowupPayload): FollowupPayload {
-  const headers = workbookHeaders(original);
-  const sheet = snapshot?.sheets?.['followup-sheet'];
+  const originalHeaders = workbookHeaders(original);
+  const headers = sheetHeadersFromSnapshot(snapshot, originalHeaders);
+  const sheet = firstSnapshotSheet(snapshot);
   const cells = sheet?.cellData || {};
   const patientsById = Object.fromEntries(original.patients.map((patient) => [patient.patient_id, patient]));
   const nextPatients: Patient[] = [];
@@ -1480,7 +1594,9 @@ function updatePayloadSummary(payload: FollowupPayload, suffix = '') {
   const metas = buildColumnMeta();
   const hiddenCount = metas.filter((meta) => getHiddenColumnKeys().has(meta.key)).length;
   summaryEl.textContent = `${payload.patients.length} 位患者 · 药敏 ${payload.drug_sensitivity.length} 条 · 随访 ${payload.followups.length} 条 · ${expanded ? '药敏明细展开' : '药敏摘要视图'} · 隐藏 ${hiddenCount} 列${tail}`;
-  renderCustomGroupPanel();
+  renderCustomGroupPanel().catch(() => {
+    customGroupPanelEl.innerHTML = renderCustomColumnGroups(buildColumnMeta(), getHiddenColumnKeys());
+  });
   renderColumnPanel();
 }
 
@@ -1762,9 +1878,14 @@ columnPanelToggleEl.addEventListener('click', () => {
 });
 
 customGroupToggleEl.addEventListener('click', () => {
-  renderCustomGroupPanel();
   customGroupPanelEl.classList.toggle('hidden');
   columnPanelEl.classList.add('hidden');
+  if (customGroupPanelEl.classList.contains('hidden')) return;
+  customGroupPanelEl.innerHTML = '<div class="custom-column-empty">正在读取当前表格列...</div>';
+  renderCustomGroupPanel().catch((error) => {
+    statusEl.textContent = '自定义分组读取列失败';
+    summaryEl.textContent = error instanceof Error ? error.message : String(error);
+  });
 });
 
 columnPanelEl.addEventListener('change', (event) => {
@@ -1858,7 +1979,8 @@ function updateCustomGroupFormCounts(row: HTMLElement) {
 
 async function handleCustomGroupAction(button: HTMLButtonElement) {
   const action = button.dataset.columnAction;
-  const metas = buildColumnMeta();
+  const metas = action === 'custom-close' ? customGroupMetasForCurrentPanel() : await currentTableColumnMeta();
+  lastCustomGroupMetas = metas;
   const hidden = getHiddenColumnKeys();
 
   if (action === 'custom-close') {
@@ -1867,13 +1989,13 @@ async function handleCustomGroupAction(button: HTMLButtonElement) {
   }
   if (action === 'custom-edit') {
     customColumnGroupEditorOpen = !customColumnGroupEditorOpen;
-    renderCustomGroupPanel();
+    await renderCustomGroupPanel();
     customGroupPanelEl.classList.remove('hidden');
     return;
   }
   if (action === 'custom-cancel') {
     customColumnGroupEditorOpen = false;
-    renderCustomGroupPanel();
+    await renderCustomGroupPanel();
     customGroupPanelEl.classList.remove('hidden');
     return;
   }
@@ -1881,7 +2003,7 @@ async function handleCustomGroupAction(button: HTMLButtonElement) {
     customColumnGroups = normalizeCustomColumnGroups(customGroupsTemplate(metas));
     customColumnGroupEditorOpen = true;
     statusEl.textContent = '已填入示例分组';
-    renderCustomGroupPanel();
+    await renderCustomGroupPanel();
     customGroupPanelEl.classList.remove('hidden');
     return;
   }
@@ -1894,7 +2016,7 @@ async function handleCustomGroupAction(button: HTMLButtonElement) {
       ],
     };
     customColumnGroupEditorOpen = true;
-    renderCustomGroupPanel();
+    await renderCustomGroupPanel();
     customGroupPanelEl.classList.remove('hidden');
     return;
   }
@@ -1905,7 +2027,7 @@ async function handleCustomGroupAction(button: HTMLButtonElement) {
     groups.splice(index, 1);
     await saveCustomColumnGroups({ version: 1, groups });
     statusEl.textContent = '自定义分组已删除';
-    renderCustomGroupPanel();
+    await renderCustomGroupPanel();
     return;
   }
   if (action === 'custom-save-form') {
@@ -1913,7 +2035,7 @@ async function handleCustomGroupAction(button: HTMLButtonElement) {
       await saveCustomColumnGroups(customGroupConfigFromForm());
       customColumnGroupEditorOpen = false;
       statusEl.textContent = '自定义分组已保存';
-      renderCustomGroupPanel();
+      await renderCustomGroupPanel();
       customGroupPanelEl.classList.remove('hidden');
     } catch (error) {
       statusEl.textContent = '自定义分组保存失败';
@@ -1938,7 +2060,7 @@ async function handleCustomGroupAction(button: HTMLButtonElement) {
         ],
       });
       statusEl.textContent = '当前列显示已保存为分组';
-      renderCustomGroupPanel();
+      await renderCustomGroupPanel();
       customGroupPanelEl.classList.remove('hidden');
     } catch (error) {
       statusEl.textContent = '自定义分组保存失败';
@@ -2004,20 +2126,27 @@ customGroupPanelEl.addEventListener('change', (event) => {
   const index = Number(input.dataset.customGroupToggle);
   const group = customColumnGroups.groups[index];
   if (!group) return;
-  const keys = customGroupColumnKeys(group);
-  if (!keys.size) {
-    statusEl.textContent = '自定义分组没有匹配列';
-    renderCustomGroupPanel();
-    customGroupPanelEl.classList.remove('hidden');
-    return;
-  }
-  const hidden = getHiddenColumnKeys();
-  keys.forEach((key) => {
-    if (input.checked) hidden.delete(key);
-    else hidden.add(key);
+  (async () => {
+    const metas = await currentTableColumnMeta();
+    lastCustomGroupMetas = metas;
+    const keys = customGroupColumnKeys(group, metas);
+    if (!keys.size) {
+      statusEl.textContent = '自定义分组没有匹配列';
+      await renderCustomGroupPanel();
+      customGroupPanelEl.classList.remove('hidden');
+      return;
+    }
+    const hidden = getHiddenColumnKeys();
+    keys.forEach((key) => {
+      if (input.checked) hidden.delete(key);
+      else hidden.add(key);
+    });
+    setHiddenColumnKeys(hidden);
+    reloadForColumns();
+  })().catch((error) => {
+    statusEl.textContent = '自定义分组操作失败';
+    summaryEl.textContent = error instanceof Error ? error.message : String(error);
   });
-  setHiddenColumnKeys(hidden);
-  reloadForColumns();
 });
 
 columnPanelEl.addEventListener('click', async (event) => {
