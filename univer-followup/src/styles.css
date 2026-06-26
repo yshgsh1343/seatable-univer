@@ -287,7 +287,10 @@ button:hover {
 
 .custom-column-editor {
   display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
   gap: 12px;
+  max-height: min(620px, calc(100vh - 190px));
+  overflow: hidden;
   margin-top: 12px;
   padding-top: 12px;
   border-top: 1px solid #e2e8f0;
@@ -296,6 +299,11 @@ button:hover {
 .custom-group-form {
   display: grid;
   gap: 10px;
+  min-height: 0;
+  max-height: min(540px, calc(100vh - 260px));
+  overflow: auto;
+  padding-right: 4px;
+  scrollbar-width: thin;
 }
 
 .custom-group-form-row {
@@ -344,9 +352,10 @@ button:hover {
 .custom-group-column-picker {
   display: grid;
   gap: 10px;
-  max-height: min(480px, calc(100vh - 280px));
+  max-height: min(380px, calc(100vh - 330px));
   overflow: auto;
   padding-right: 2px;
+  scrollbar-width: thin;
 }
 
 .custom-group-column-section {
