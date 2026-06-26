@@ -8,7 +8,15 @@ body {
   margin: 0;
   background: #f5f7fb;
   color: #172033;
-  font-family: Inter, "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+  font-family: "MiSans", "Misans", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+}
+
+body *,
+button,
+input,
+textarea,
+select {
+  font-family: "MiSans", "Misans", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
 }
 
 #shell {
@@ -77,6 +85,28 @@ button {
   white-space: nowrap;
 }
 
+input,
+textarea {
+  box-sizing: border-box;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #172033;
+  font-size: 13px;
+}
+
+input {
+  height: 32px;
+  padding: 0 10px;
+}
+
+textarea {
+  min-height: 74px;
+  padding: 8px 10px;
+  resize: vertical;
+  line-height: 1.45;
+}
+
 button:hover {
   border-color: #2563eb;
   color: #1d4ed8;
@@ -105,6 +135,10 @@ button:hover {
 
 .column-panel.hidden {
   display: none;
+}
+
+.custom-group-panel {
+  width: min(760px, calc(100vw - 32px));
 }
 
 .column-panel-header {
@@ -136,6 +170,125 @@ button:hover {
   height: 30px;
   padding: 0 10px;
   font-size: 12px;
+}
+
+.custom-column-panel {
+  padding: 12px;
+}
+
+.custom-column-panel-head,
+.custom-column-group-head,
+.custom-group-form-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.custom-column-panel-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  margin: -12px -12px 12px;
+  padding: 12px;
+  border-bottom: 1px solid #e2e8f0;
+  background: #ffffff;
+}
+
+.custom-column-panel-title {
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.custom-column-panel-summary,
+.custom-column-group-summary,
+.custom-column-empty,
+.custom-group-form-head span {
+  color: #64748b;
+  font-size: 12px;
+}
+
+.custom-column-panel-actions,
+.custom-column-group-actions,
+.custom-column-editor-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.custom-column-panel-actions button,
+.custom-column-group-actions button,
+.custom-column-editor-actions button,
+.custom-group-form-row > button {
+  height: 30px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.custom-column-groups {
+  display: grid;
+  gap: 10px;
+}
+
+.custom-column-group {
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.custom-column-group-head {
+  padding: 10px;
+}
+
+.custom-column-group-name {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.custom-column-editor {
+  display: grid;
+  gap: 12px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #e2e8f0;
+}
+
+.custom-group-form {
+  display: grid;
+  gap: 10px;
+}
+
+.custom-group-form-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.8fr) minmax(180px, 1.2fr) minmax(180px, 1fr) auto;
+  gap: 10px;
+  align-items: start;
+  padding: 10px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.custom-group-form-row label {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.custom-group-form-row label span {
+  color: #475569;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.custom-group-form-row input,
+.custom-group-form-row textarea {
+  width: 100%;
+}
+
+.custom-group-form-row > button {
+  margin-top: 23px;
 }
 
 .column-groups {

@@ -9,6 +9,7 @@ scripts/
 univer-followup/import/
 univer-followup/server.py
 univer-followup/public/followup.json*
+univer-followup/column-groups.json*
 univer-followup/dist/
 univer-followup/sync-backups/
 univer-followup/cold-backups/

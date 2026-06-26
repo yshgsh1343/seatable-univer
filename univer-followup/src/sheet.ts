@@ -1,4 +1,4 @@
-import { LocaleType, mergeLocales, Univer, UniverInstanceType } from '@univerjs/core';
+import { HorizontalAlign, LocaleType, mergeLocales, Univer, UniverInstanceType } from '@univerjs/core';
 import { FUniver } from '@univerjs/core/facade';
 import DesignZhCN from '@univerjs/design/locale/zh-CN';
 import { UniverDocsPlugin } from '@univerjs/docs';
@@ -62,10 +62,12 @@ interface FollowupPayload {
   changed_raw_tables?: string[];
 }
 
-const HEADER_ROWS = 3;
+const HEADER_ROWS = 2;
 const EXTRA_EMPTY_ROWS = 5;
 const HIDDEN_COLUMNS_KEY = 'hidden_columns_v2';
+const CUSTOM_COLUMN_GROUPS_KEY = 'custom_column_groups_v1';
 const REMOTE_POLL_INTERVAL_MS = 60000;
+const AUTO_SAVE_INTERVAL_MS = 4000;
 const SELF_SAVE_GRACE_MS = 12000;
 const RAW_HEADER_ROWS = 1;
 const RAW_SHEET_PREFIX = 'seatable-raw-';
@@ -76,7 +78,9 @@ const statusEl = document.getElementById('status')!;
 const reloadEl = document.getElementById('reloadFull') as HTMLButtonElement;
 const saveSyncEl = document.getElementById('saveSync') as HTMLButtonElement;
 const refreshSyncEl = document.getElementById('refreshSync') as HTMLButtonElement;
+const customGroupToggleEl = document.getElementById('customGroupToggle') as HTMLButtonElement;
 const columnPanelToggleEl = document.getElementById('columnPanelToggle') as HTMLButtonElement;
+const customGroupPanelEl = document.getElementById('customGroupPanel')!;
 const columnPanelEl = document.getElementById('columnPanel')!;
 
 let currentPayload: FollowupPayload | null = null;
@@ -88,6 +92,9 @@ let lastLocalSaveAt = 0;
 let currentUniver: any = null;
 let syncInitTimer: number | null = null;
 let syncPollTimer: number | null = null;
+let syncAutoSaveTimer: number | null = null;
+let customColumnGroups: CustomColumnGroupConfig = { version: 1, groups: [] };
+let customColumnGroupEditorOpen = false;
 
 const xlsxHeaders = xlsxHeaderTemplate as string[];
 const headerAliases: Record<string, string> = {
@@ -114,6 +121,16 @@ interface ColumnMeta {
 }
 
 type ColumnGroup = 'basic' | 'clinical' | 'pathology' | 'ihc' | 'molecular' | 'imaging' | 'drug' | 'followup';
+interface CustomColumnGroup {
+  name: string;
+  columns?: string[];
+  keys?: string[];
+  match?: string[];
+}
+interface CustomColumnGroupConfig {
+  version?: number;
+  groups: CustomColumnGroup[];
+}
 interface DetailColumn {
   key: string;
   label: string;
@@ -346,6 +363,91 @@ function setHiddenColumnKeys(keys: Set<string>) {
   localStorage.setItem(HIDDEN_COLUMNS_KEY, JSON.stringify([...keys]));
 }
 
+function normalizeCustomColumnGroups(value: any): CustomColumnGroupConfig {
+  const rawGroups = Array.isArray(value?.groups) ? value.groups : [];
+  const groups = rawGroups.map((group: any) => ({
+    name: String(group?.name || '').trim(),
+    columns: Array.isArray(group?.columns) ? group.columns.map((item: any) => String(item).trim()).filter(Boolean) : [],
+    keys: Array.isArray(group?.keys) ? group.keys.map((item: any) => String(item).trim()).filter(Boolean) : [],
+    match: Array.isArray(group?.match) ? group.match.map((item: any) => String(item).trim()).filter(Boolean) : [],
+  })).filter((group: CustomColumnGroup) => group.name && (
+    (group.columns?.length || 0) > 0
+    || (group.keys?.length || 0) > 0
+    || (group.match?.length || 0) > 0
+  ));
+  return { version: Number(value?.version) || 1, groups };
+}
+
+async function loadCustomColumnGroups() {
+  try {
+    const response = await fetch('/api/column-groups', { method: 'GET' });
+    if (response.ok) {
+      customColumnGroups = normalizeCustomColumnGroups(await response.json());
+      localStorage.setItem(CUSTOM_COLUMN_GROUPS_KEY, JSON.stringify(customColumnGroups));
+      return;
+    }
+  } catch {
+    // Fall back to browser-local configuration when the Go API is not available.
+  }
+  try {
+    customColumnGroups = normalizeCustomColumnGroups(JSON.parse(localStorage.getItem(CUSTOM_COLUMN_GROUPS_KEY) || '{}'));
+  } catch {
+    customColumnGroups = { version: 1, groups: [] };
+  }
+}
+
+async function saveCustomColumnGroups(config: CustomColumnGroupConfig) {
+  const normalized = normalizeCustomColumnGroups(config);
+  customColumnGroups = normalized;
+  localStorage.setItem(CUSTOM_COLUMN_GROUPS_KEY, JSON.stringify(normalized));
+  const response = await fetch('/api/column-groups', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(normalized),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || result.ok === false) throw new Error(result.error || `HTTP ${response.status}`);
+}
+
+function customGroupColumnKeys(group: CustomColumnGroup, metas = buildColumnMeta()) {
+  const exact = new Set([...(group.columns || []), ...(group.keys || [])].map((item) => item.toLowerCase()));
+  const matches = (group.match || []).map((item) => item.toLowerCase());
+  const keys = metas.filter((meta) => {
+    const values = [meta.key, meta.label, meta.sourceKey || '', meta.drugName || '', meta.drugField || '']
+      .filter(Boolean)
+      .map((item) => item.toLowerCase());
+    return values.some((value) => exact.has(value)) || matches.some((pattern) => values.some((value) => value.includes(pattern)));
+  }).map((meta) => meta.key);
+  return new Set(keys);
+}
+
+function customGroupsTemplate(metas = buildColumnMeta()) {
+  return {
+    version: 1,
+    groups: [
+      {
+        name: '核心信息',
+        columns: metas.slice(0, Math.min(8, metas.length)).map((meta) => meta.label),
+      },
+      {
+        name: '随访相关',
+        match: ['随访', '结局', '疗效'],
+      },
+    ],
+  };
+}
+
+function customGroupInputList(value: string) {
+  return value
+    .split(/[\n,，、;；]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function customGroupInputValue(values?: string[]) {
+  return (values || []).join('\n');
+}
+
 function reloadForColumns() {
   statusEl.textContent = '正在应用列显示';
   window.location.reload();
@@ -365,6 +467,82 @@ function restoreDefaultColumns() {
   localStorage.removeItem(HIDDEN_COLUMNS_KEY);
   localStorage.removeItem('drug_columns_collapsed');
   reloadForColumns();
+}
+
+function renderCustomColumnGroups(metas: ColumnMeta[], hidden: Set<string>) {
+  const groups = customColumnGroups.groups || [];
+  const groupCards = groups.length ? groups.map((group, index) => {
+    const keys = customGroupColumnKeys(group, metas);
+    const groupMetas = metas.filter((meta) => keys.has(meta.key));
+    const visibleCount = groupMetas.filter((meta) => !hidden.has(meta.key)).length;
+    const columnNames = groupMetas.slice(0, 8).map((meta) => meta.label).join('、');
+    return `
+      <section class="custom-column-group">
+        <div class="custom-column-group-head">
+          <div>
+            <div class="custom-column-group-name">${escapeHtml(group.name)}</div>
+            <div class="custom-column-group-summary">${visibleCount}/${groupMetas.length} 列${columnNames ? ` · ${escapeHtml(columnNames)}` : ''}</div>
+          </div>
+          <div class="custom-column-group-actions">
+            <button type="button" data-column-action="custom-show" data-custom-group-index="${index}">显示</button>
+            <button type="button" data-column-action="custom-hide" data-custom-group-index="${index}">折叠</button>
+            <button type="button" data-column-action="custom-only" data-custom-group-index="${index}">仅此组</button>
+          </div>
+        </div>
+      </section>
+    `;
+  }).join('') : '<div class="custom-column-empty">未配置自定义分组</div>';
+  const editorRows = groups.map((group, index) => `
+    <div class="custom-group-form-row" data-custom-group-form-index="${index}">
+      <label>
+        <span>分组名</span>
+        <input data-custom-field="name" value="${escapeHtml(group.name)}" />
+      </label>
+      <label>
+        <span>列名</span>
+        <textarea data-custom-field="columns" spellcheck="false">${escapeHtml(customGroupInputValue(group.columns || group.keys))}</textarea>
+      </label>
+      <label>
+        <span>关键词</span>
+        <textarea data-custom-field="match" spellcheck="false">${escapeHtml(customGroupInputValue(group.match))}</textarea>
+      </label>
+      <button type="button" data-column-action="custom-delete" data-custom-group-index="${index}">删除</button>
+    </div>
+  `).join('');
+  const editor = customColumnGroupEditorOpen ? `
+    <div class="custom-column-editor">
+      <div class="custom-group-form-head">
+        <span>每行填写一个列名或关键词</span>
+        <div class="custom-column-editor-actions">
+          <button type="button" data-column-action="custom-add">新增分组</button>
+          <button type="button" data-column-action="custom-save-form">保存分组</button>
+          <button type="button" data-column-action="custom-cancel">取消</button>
+        </div>
+      </div>
+      <div class="custom-group-form">${editorRows || '<div class="custom-column-empty">暂无可编辑分组</div>'}</div>
+    </div>
+  ` : '';
+  return `
+    <section class="custom-column-panel">
+      <div class="custom-column-panel-head">
+        <div>
+          <div class="custom-column-panel-title">自定义分组</div>
+          <div class="custom-column-panel-summary">${groups.length} 组</div>
+        </div>
+        <div class="custom-column-panel-actions">
+          <button type="button" data-column-action="custom-save-current">保存当前为分组</button>
+          <button type="button" data-column-action="custom-edit">${customColumnGroupEditorOpen ? '收起编辑' : '编辑分组'}</button>
+          <button type="button" data-column-action="custom-close">关闭</button>
+        </div>
+      </div>
+      <div class="custom-column-groups">${groupCards}</div>
+      ${editor}
+    </section>
+  `;
+}
+
+function renderCustomGroupPanel() {
+  customGroupPanelEl.innerHTML = renderCustomColumnGroups(buildColumnMeta(), getHiddenColumnKeys());
 }
 
 function renderColumnPanel() {
@@ -818,8 +996,8 @@ function makeRawWorkbook(payload: FollowupPayload) {
     sheetOrder,
     styles: {
       header: { bg: { rgb: colors.header }, bl: 1, ht: 2, vt: 2, fs: 11, tb: 2 },
-      body: { fs: 11, vt: 2 },
-      wrap: { fs: 11, vt: 1, tb: 2 },
+      body: { fs: 11, vt: 2, ht: HorizontalAlign.LEFT },
+      wrap: { fs: 11, vt: 1, ht: HorizontalAlign.LEFT, tb: 2 },
     },
     sheets,
   };
@@ -869,7 +1047,6 @@ function makeXlsxWorkbook(payload: FollowupPayload) {
   const rowData: any = {
     0: { h: 34 },
     1: { h: 32 },
-    2: { h: 32 },
   };
 
   let start = 0;
@@ -884,7 +1061,6 @@ function makeXlsxWorkbook(payload: FollowupPayload) {
 
   headers.forEach((header, index) => {
     put(cells, 1, index, header, 'header');
-    merges.push(merge(1, 2, index, index));
     const meta = columnMeta[index];
     let width = 126;
     if (header.includes('诊断') || header.includes('免疫组化') || header.includes('分子分型')) width = 180;
@@ -922,10 +1098,10 @@ function makeXlsxWorkbook(payload: FollowupPayload) {
       groupFollowup: { bg: { rgb: colors.followup }, bl: 1, ht: 2, vt: 2, fs: 12 },
       subDrug: { bg: { rgb: '#BBF7D0' }, bl: 1, ht: 2, vt: 2, fs: 11 },
       header: { bg: { rgb: colors.header }, bl: 1, ht: 2, vt: 2, fs: 11, tb: 2 },
-      body: { fs: 11, vt: 2 },
-      wrap: { fs: 11, vt: 1, tb: 2 },
-      high: { bg: { rgb: colors.high }, fs: 11, vt: 2 },
-      warn: { bg: { rgb: colors.warn }, fs: 11, vt: 2 },
+      body: { fs: 11, vt: 2, ht: HorizontalAlign.LEFT },
+      wrap: { fs: 11, vt: 1, ht: HorizontalAlign.LEFT, tb: 2 },
+      high: { bg: { rgb: colors.high }, fs: 11, vt: 2, ht: HorizontalAlign.LEFT },
+      warn: { bg: { rgb: colors.warn }, fs: 11, vt: 2, ht: HorizontalAlign.LEFT },
     },
     sheets: {
       'followup-sheet': {
@@ -1083,10 +1259,10 @@ function makeWorkbook(payload: FollowupPayload) {
       groupFollowup: { bg: { rgb: colors.followup }, bl: 1, ht: 2, vt: 2, fs: 12 },
       subDrug: { bg: { rgb: '#BBF7D0' }, bl: 1, ht: 2, vt: 2, fs: 11 },
       header: { bg: { rgb: colors.header }, bl: 1, ht: 2, vt: 2, fs: 11 },
-      body: { fs: 11, vt: 2 },
-      wrap: { fs: 11, vt: 1, tb: 2 },
-      high: { bg: { rgb: colors.high }, fs: 11, vt: 2 },
-      warn: { bg: { rgb: colors.warn }, fs: 11, vt: 2 },
+      body: { fs: 11, vt: 2, ht: HorizontalAlign.LEFT },
+      wrap: { fs: 11, vt: 1, ht: HorizontalAlign.LEFT, tb: 2 },
+      high: { bg: { rgb: colors.high }, fs: 11, vt: 2, ht: HorizontalAlign.LEFT },
+      warn: { bg: { rgb: colors.warn }, fs: 11, vt: 2, ht: HorizontalAlign.LEFT },
     },
     sheets: {
       'followup-sheet': {
@@ -1246,20 +1422,27 @@ function updatePayloadSummary(payload: FollowupPayload, suffix = '') {
   if (hasRawTables(payload)) {
     const rawRows = (payload.raw_tables || []).reduce((sum, table) => sum + (table.rows?.length || 0), 0);
     summaryEl.textContent = `${payload.raw_tables?.length || 0} 张 SeaTable 表 · ${rawRows} 行${tail}`;
-    [reloadEl, columnPanelToggleEl].forEach((item) => {
+    [reloadEl, customGroupToggleEl, columnPanelToggleEl].forEach((item) => {
       item.hidden = true;
     });
+    customGroupPanelEl.hidden = true;
     columnPanelEl.hidden = true;
     return;
   }
-  [reloadEl, columnPanelToggleEl].forEach((item) => {
+  [reloadEl, customGroupToggleEl, columnPanelToggleEl].forEach((item) => {
     item.hidden = false;
   });
+  customGroupPanelEl.hidden = false;
   columnPanelEl.hidden = false;
   const metas = buildColumnMeta();
   const hiddenCount = metas.filter((meta) => getHiddenColumnKeys().has(meta.key)).length;
   summaryEl.textContent = `${payload.patients.length} 位患者 · 药敏 ${payload.drug_sensitivity.length} 条 · 随访 ${payload.followups.length} 条 · ${expanded ? '药敏明细展开' : '药敏摘要视图'} · 隐藏 ${hiddenCount} 列${tail}`;
+  renderCustomGroupPanel();
   renderColumnPanel();
+}
+
+function setSyncStatus(message: string) {
+  statusEl.textContent = `同步：${message}`;
 }
 
 function stopRealtimeSync() {
@@ -1271,22 +1454,26 @@ function stopRealtimeSync() {
     window.clearInterval(syncPollTimer);
     syncPollTimer = null;
   }
+  if (syncAutoSaveTimer !== null) {
+    window.clearInterval(syncAutoSaveTimer);
+    syncAutoSaveTimer = null;
+  }
 }
 
 async function saveCurrentWorkbook(mode: '手动' | '自动', finishEditing: boolean) {
   if (!currentPayload || isSaving || isRefreshing) return;
   if (!hasRawTables(currentPayload) && !expanded && !workbookHeaders(currentPayload).length) {
-    statusEl.textContent = '摘要视图不自动写回';
+    setSyncStatus('摘要视图不自动写回');
     return;
   }
   isSaving = true;
   try {
     if (mode === '手动') saveSyncEl.disabled = true;
-    statusEl.textContent = mode === '自动' ? '自动保存中' : '正在保存联动';
+    setSyncStatus(mode === '自动' ? '正在保存' : '正在手动保存');
     const snapshot = await workbookSnapshot(finishEditing);
     const hash = workbookHash(snapshot);
     if (mode === '自动' && hash === lastSavedWorkbookHash) {
-      statusEl.textContent = '实时同步中';
+      setSyncStatus('已同步');
       return;
     }
     if (await refreshBeforeSaveIfNeeded(hash)) return;
@@ -1314,13 +1501,13 @@ async function saveCurrentWorkbook(mode: '手动' | '自动', finishEditing: boo
       ? `SeaTable 主表 ${result.seatable.patients || result.seatable.updated || 0} · 药敏 ${result.seatable.drugs || 0} · 随访 ${result.seatable.followups || 0} · 删除 ${deletedStructured}`
       : `SeaTable未写入: ${result.seatable?.error || '未配置'}`;
     syncSummary(payload, `${mode}保存 ${result.saved_at}`);
-    statusEl.textContent = `${mode}保存完成 · ${seatableText}`;
+    setSyncStatus(`已同步 · ${seatableText}`);
     if (hasRawTables(payload) && rawPayloadHasNewRows(payload)) {
-      statusEl.textContent = '新增行已写入 SeaTable，正在刷新 row_id';
+      setSyncStatus('新增行已写入，正在刷新 row_id');
       window.setTimeout(() => refreshFromSeaTable('自动'), 300);
     }
   } catch (error) {
-    statusEl.textContent = `${mode}保存失败`;
+    setSyncStatus(`${mode}保存失败`);
     summaryEl.textContent = error instanceof Error ? error.message : String(error);
   } finally {
     if (mode === '手动') saveSyncEl.disabled = false;
@@ -1333,7 +1520,7 @@ async function refreshFromSeaTable(mode: '手动' | '自动') {
   isRefreshing = true;
   try {
     if (mode === '手动') refreshSyncEl.disabled = true;
-    statusEl.textContent = mode === '自动' ? '检测到 SeaTable 新版本，正在同步' : '正在从 SeaTable 刷新';
+    setSyncStatus(mode === '自动' ? '检测到 SeaTable 新版本，正在同步' : '正在从 SeaTable 刷新');
     const response = await fetch('/api/refresh', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1349,7 +1536,7 @@ async function refreshFromSeaTable(mode: '手动' | '自动') {
     mountWorkbook(payload, `SeaTable 已同步 · 患者 ${counts.patients || 0} · 药敏 ${counts.drugs || 0} · 随访 ${counts.followups || 0}`);
   } catch (error) {
     isRefreshing = false;
-    statusEl.textContent = '刷新失败';
+    setSyncStatus('刷新失败');
     summaryEl.textContent = error instanceof Error ? error.message : String(error);
     if (mode === '手动') refreshSyncEl.disabled = false;
   } finally {
@@ -1396,7 +1583,7 @@ async function refreshIfRemoteChanged() {
   }
   const snapshot = await workbookSnapshot(false);
   if (workbookHash(snapshot) !== lastSavedWorkbookHash) {
-    statusEl.textContent = 'SeaTable 有更新，本地也有未保存修改，自动同步暂停';
+    setSyncStatus('SeaTable 有更新，本地也有未保存修改，已暂停');
     return;
   }
   await refreshFromSeaTable('自动');
@@ -1404,7 +1591,7 @@ async function refreshIfRemoteChanged() {
 
 function startRealtimeSync() {
   if (currentPayload && !hasRawTables(currentPayload) && !expanded && !workbookHeaders(currentPayload).length) {
-    statusEl.textContent = '摘要视图已加载，在列显示中切换到药敏明细后启用实时写回';
+    setSyncStatus('摘要视图已加载，切换到药敏明细后启用写回');
     return;
   }
   stopRealtimeSync();
@@ -1414,19 +1601,21 @@ function startRealtimeSync() {
       lastSavedWorkbookHash = workbookHash(snapshot);
       const state = await pollRemoteState();
       lastRemoteSignature = state.signature || '';
-      statusEl.textContent = '实时同步中';
+      setSyncStatus('已同步');
+      syncAutoSaveTimer = window.setInterval(async () => {
+        await saveCurrentWorkbook('自动', false);
+      }, AUTO_SAVE_INTERVAL_MS);
+      syncPollTimer = window.setInterval(async () => {
+        try {
+          await refreshIfRemoteChanged();
+        } catch (error) {
+          setSyncStatus('SeaTable 远端检查失败');
+        }
+      }, REMOTE_POLL_INTERVAL_MS);
     } catch (error) {
-      statusEl.textContent = '实时同步初始化失败';
+      setSyncStatus('初始化失败');
     }
   }, 3000);
-
-  syncPollTimer = window.setInterval(async () => {
-    try {
-      await refreshIfRemoteChanged();
-    } catch (error) {
-      statusEl.textContent = 'SeaTable 远端检查失败';
-    }
-  }, REMOTE_POLL_INTERVAL_MS);
 }
 
 function mountWorkbook(payload: FollowupPayload, status: string) {
@@ -1479,7 +1668,7 @@ function mountWorkbook(payload: FollowupPayload, status: string) {
   (window as any).univer = univer;
   (window as any).univerAPI = FUniver.newAPI(univer);
   registerContextMenuActions();
-  statusEl.textContent = status;
+  setSyncStatus(status || '初始化中');
   startRealtimeSync();
 }
 
@@ -1490,8 +1679,10 @@ async function boot() {
   });
   const openSheetEl = document.getElementById('openSheet');
   if (openSheetEl) openSheetEl.hidden = true;
+  saveSyncEl.hidden = true;
+  await loadCustomColumnGroups();
   const payload: FollowupPayload = await fetch('/followup.json').then((response) => response.json());
-  mountWorkbook(payload, '已加载，双击或输入可编辑');
+  mountWorkbook(payload, '已加载，正在初始化同步');
 }
 
 saveSyncEl.addEventListener('click', async () => {
@@ -1504,14 +1695,14 @@ refreshSyncEl.addEventListener('click', async () => {
 
 window.addEventListener('focus', () => {
   refreshIfRemoteChanged().catch(() => {
-    statusEl.textContent = 'SeaTable 远端检查失败';
+    setSyncStatus('SeaTable 远端检查失败');
   });
 });
 
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible') return;
   refreshIfRemoteChanged().catch(() => {
-    statusEl.textContent = 'SeaTable 远端检查失败';
+    setSyncStatus('SeaTable 远端检查失败');
   });
 });
 
@@ -1524,6 +1715,13 @@ reloadEl.addEventListener('click', () => {
 columnPanelToggleEl.addEventListener('click', () => {
   renderColumnPanel();
   columnPanelEl.classList.toggle('hidden');
+  customGroupPanelEl.classList.add('hidden');
+});
+
+customGroupToggleEl.addEventListener('click', () => {
+  renderCustomGroupPanel();
+  customGroupPanelEl.classList.toggle('hidden');
+  columnPanelEl.classList.add('hidden');
 });
 
 columnPanelEl.addEventListener('change', (event) => {
@@ -1569,7 +1767,144 @@ columnPanelEl.addEventListener('change', (event) => {
   }
 });
 
-columnPanelEl.addEventListener('click', (event) => {
+function customGroupConfigFromForm() {
+  const rows = [...customGroupPanelEl.querySelectorAll<HTMLElement>('.custom-group-form-row')];
+  return normalizeCustomColumnGroups({
+    version: 1,
+    groups: rows.map((row) => {
+      const name = (row.querySelector<HTMLInputElement>('[data-custom-field="name"]')?.value || '').trim();
+      const columns = customGroupInputList(row.querySelector<HTMLTextAreaElement>('[data-custom-field="columns"]')?.value || '');
+      const match = customGroupInputList(row.querySelector<HTMLTextAreaElement>('[data-custom-field="match"]')?.value || '');
+      return { name, columns, match };
+    }),
+  });
+}
+
+async function handleCustomGroupAction(button: HTMLButtonElement) {
+  const action = button.dataset.columnAction;
+  const metas = buildColumnMeta();
+  const hidden = getHiddenColumnKeys();
+
+  if (action === 'custom-close') {
+    customGroupPanelEl.classList.add('hidden');
+    return;
+  }
+  if (action === 'custom-edit') {
+    customColumnGroupEditorOpen = !customColumnGroupEditorOpen;
+    renderCustomGroupPanel();
+    customGroupPanelEl.classList.remove('hidden');
+    return;
+  }
+  if (action === 'custom-cancel') {
+    customColumnGroupEditorOpen = false;
+    renderCustomGroupPanel();
+    customGroupPanelEl.classList.remove('hidden');
+    return;
+  }
+  if (action === 'custom-template') {
+    customColumnGroups = normalizeCustomColumnGroups(customGroupsTemplate(metas));
+    customColumnGroupEditorOpen = true;
+    statusEl.textContent = '已填入示例分组';
+    renderCustomGroupPanel();
+    customGroupPanelEl.classList.remove('hidden');
+    return;
+  }
+  if (action === 'custom-add') {
+    customColumnGroups = normalizeCustomColumnGroups({
+      version: 1,
+      groups: [
+        ...(customColumnGroups.groups || []),
+        { name: '新分组', columns: [], match: ['随访'] },
+      ],
+    });
+    customColumnGroupEditorOpen = true;
+    renderCustomGroupPanel();
+    customGroupPanelEl.classList.remove('hidden');
+    return;
+  }
+  if (action === 'custom-delete') {
+    const index = Number(button.dataset.customGroupIndex);
+    const groups = [...(customColumnGroups.groups || [])];
+    if (!Number.isFinite(index) || !groups[index]) return;
+    groups.splice(index, 1);
+    await saveCustomColumnGroups({ version: 1, groups });
+    statusEl.textContent = '自定义分组已删除';
+    renderCustomGroupPanel();
+    return;
+  }
+  if (action === 'custom-save-form') {
+    try {
+      await saveCustomColumnGroups(customGroupConfigFromForm());
+      customColumnGroupEditorOpen = false;
+      statusEl.textContent = '自定义分组已保存';
+      renderCustomGroupPanel();
+      customGroupPanelEl.classList.remove('hidden');
+    } catch (error) {
+      statusEl.textContent = '自定义分组保存失败';
+      summaryEl.textContent = error instanceof Error ? error.message : String(error);
+    }
+    return;
+  }
+  if (action === 'custom-save-current') {
+    const name = window.prompt('分组名称');
+    if (!name?.trim()) return;
+    const visibleColumns = metas.filter((meta) => !hidden.has(meta.key)).map((meta) => meta.label);
+    if (!visibleColumns.length) {
+      statusEl.textContent = '当前没有可保存的可见列';
+      return;
+    }
+    try {
+      await saveCustomColumnGroups({
+        version: 1,
+        groups: [
+          ...(customColumnGroups.groups || []),
+          { name: name.trim(), columns: visibleColumns },
+        ],
+      });
+      statusEl.textContent = '当前列显示已保存为分组';
+      renderCustomGroupPanel();
+      customGroupPanelEl.classList.remove('hidden');
+    } catch (error) {
+      statusEl.textContent = '自定义分组保存失败';
+      summaryEl.textContent = error instanceof Error ? error.message : String(error);
+    }
+    return;
+  }
+  if (action === 'custom-show' || action === 'custom-hide' || action === 'custom-only') {
+    const index = Number(button.dataset.customGroupIndex);
+    const group = customColumnGroups.groups[index];
+    if (!group) return;
+    const keys = customGroupColumnKeys(group, metas);
+    if (!keys.size) {
+      statusEl.textContent = '自定义分组没有匹配列';
+      return;
+    }
+    if (action === 'custom-only') {
+      metas.forEach((meta) => {
+        if (keys.has(meta.key)) hidden.delete(meta.key);
+        else hidden.add(meta.key);
+      });
+    } else {
+      keys.forEach((key) => {
+        if (action === 'custom-show') hidden.delete(key);
+        else hidden.add(key);
+      });
+    }
+    setHiddenColumnKeys(hidden);
+    reloadForColumns();
+  }
+}
+
+customGroupPanelEl.addEventListener('click', (event) => {
+  const button = event.target instanceof HTMLElement ? event.target.closest('button[data-column-action]') : null;
+  if (!(button instanceof HTMLButtonElement)) return;
+  handleCustomGroupAction(button).catch((error) => {
+    statusEl.textContent = '自定义分组操作失败';
+    summaryEl.textContent = error instanceof Error ? error.message : String(error);
+  });
+});
+
+columnPanelEl.addEventListener('click', async (event) => {
   const button = event.target instanceof HTMLElement ? event.target.closest('button[data-column-action]') : null;
   if (!(button instanceof HTMLButtonElement)) return;
   const action = button.dataset.columnAction;

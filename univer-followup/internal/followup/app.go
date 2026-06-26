@@ -28,6 +28,7 @@ type appConfig struct {
 	publicJSON              string
 	distJSON                string
 	backupDir               string
+	columnGroupsPath        string
 	xlsxHeadersPath         string
 	port                    string
 	seatableURL             string
@@ -103,6 +104,7 @@ func loadConfig() appConfig {
 		publicJSON:              filepath.Join(root, "public", "followup.json"),
 		distJSON:                filepath.Join(root, "dist", "followup.json"),
 		backupDir:               filepath.Join(root, "sync-backups"),
+		columnGroupsPath:        filepath.Join(root, "column-groups.json"),
 		xlsxHeadersPath:         filepath.Join(root, "xlsx_headers.json"),
 		port:                    env("PORT", "6809"),
 		seatableURL:             env("SEATABLE_URL", "http://seatable:80"),
@@ -127,6 +129,7 @@ func newApp(cfg appConfig) *app {
 func (a *app) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/remote-state", a.handleRemoteState)
+	mux.HandleFunc("/api/column-groups", a.handleColumnGroups)
 	mux.HandleFunc("/api/refresh", a.handleRefresh)
 	mux.HandleFunc("/api/save", a.handleSave)
 	mux.HandleFunc("/", a.handleStatic)
@@ -150,6 +153,46 @@ func readStringSlice(path string) []string {
 		return nil
 	}
 	return out
+}
+
+func (a *app) handleColumnGroups(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		body, err := os.ReadFile(a.cfg.columnGroupsPath)
+		if err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{"version": 1, "groups": []any{}})
+			return
+		}
+		var out map[string]any
+		if err := json.Unmarshal(body, &out); err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{"version": 1, "groups": []any{}})
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+	case http.MethodPost:
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError{OK: false, Error: err.Error()})
+			return
+		}
+		var out map[string]any
+		if err := json.Unmarshal(body, &out); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError{OK: false, Error: "invalid json"})
+			return
+		}
+		if _, ok := out["groups"].([]any); !ok {
+			writeJSON(w, http.StatusBadRequest, apiError{OK: false, Error: "groups must be an array"})
+			return
+		}
+		pretty, _ := json.MarshalIndent(out, "", "  ")
+		if err := atomicWrite(a.cfg.columnGroupsPath, pretty); err != nil {
+			writeJSON(w, http.StatusInternalServerError, apiError{OK: false, Error: err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "config": out})
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, apiError{OK: false, Error: "method not allowed"})
+	}
 }
 
 func (a *app) handleRemoteState(w http.ResponseWriter, r *http.Request) {
