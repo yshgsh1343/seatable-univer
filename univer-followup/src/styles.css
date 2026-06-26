@@ -246,7 +246,8 @@ button:hover {
 .custom-column-panel-actions button,
 .custom-column-group-actions button,
 .custom-column-editor-actions button,
-.custom-group-form-row > button {
+.custom-group-form-row > button,
+.custom-group-form-row-head button {
   height: 30px;
   padding: 0 10px;
   font-size: 12px;
@@ -299,34 +300,107 @@ button:hover {
 
 .custom-group-form-row {
   display: grid;
-  grid-template-columns: minmax(120px, 0.8fr) minmax(180px, 1.2fr) minmax(180px, 1fr) auto;
   gap: 10px;
-  align-items: start;
   padding: 10px;
   border: 1px solid #e2e8f0;
   border-radius: 8px;
   background: #f8fafc;
 }
 
-.custom-group-form-row label {
+.custom-group-form-row-head {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.custom-group-form-row-head label {
   display: grid;
   gap: 6px;
   min-width: 0;
 }
 
-.custom-group-form-row label span {
+.custom-group-form-row-head label span {
   color: #475569;
   font-size: 12px;
   font-weight: 700;
 }
 
-.custom-group-form-row input,
-.custom-group-form-row textarea {
+.custom-group-form-row-head input {
   width: 100%;
 }
 
-.custom-group-form-row > button {
+.custom-group-form-count {
+  align-self: center;
+  color: #64748b;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.custom-group-form-row-head button {
   margin-top: 23px;
+}
+
+.custom-group-column-picker {
+  display: grid;
+  gap: 10px;
+  max-height: min(480px, calc(100vh - 280px));
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.custom-group-column-section {
+  border: 1px solid #dbe4ef;
+  border-radius: 6px;
+  background: #ffffff;
+  overflow: hidden;
+}
+
+.custom-group-column-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid #edf2f7;
+  background: #f8fafc;
+}
+
+.custom-group-column-section-head label,
+.custom-group-column-option {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.custom-group-column-section-head span:first-of-type {
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.custom-group-column-count {
+  color: #64748b;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.custom-group-column-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 10px;
+  padding: 10px;
+}
+
+.custom-group-column-option {
+  font-size: 12px;
+}
+
+.custom-group-column-option span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .column-groups {
@@ -1010,7 +1084,8 @@ button:hover {
   }
 
   .column-groups,
-  .column-items {
+  .column-items,
+  .custom-group-column-options {
     grid-template-columns: 1fr;
   }
 

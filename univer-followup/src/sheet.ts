@@ -437,15 +437,34 @@ function customGroupsTemplate(metas = buildColumnMeta()) {
   };
 }
 
-function customGroupInputList(value: string) {
-  return value
-    .split(/[\n,，、;；]+/)
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
-
-function customGroupInputValue(values?: string[]) {
-  return (values || []).join('\n');
+function renderCustomGroupColumnPicker(group: CustomColumnGroup, metas: ColumnMeta[]) {
+  const selectedKeys = customGroupColumnKeys(group, metas);
+  return groupOrder.map((columnGroup) => {
+    const groupMetas = metas.filter((meta) => meta.group === columnGroup);
+    const selectedCount = groupMetas.filter((meta) => selectedKeys.has(meta.key)).length;
+    const columnItems = groupMetas.map((meta) => `
+      <label class="custom-group-column-option" title="${escapeHtml(meta.label)}">
+        <input
+          type="checkbox"
+          data-custom-column-label="${escapeHtml(meta.label)}"
+          ${selectedKeys.has(meta.key) ? 'checked' : ''}
+        />
+        <span>${escapeHtml(meta.label)}</span>
+      </label>
+    `).join('');
+    return `
+      <section class="custom-group-column-section">
+        <div class="custom-group-column-section-head">
+          <label>
+            <input type="checkbox" data-custom-section-toggle="${columnGroup}" />
+            <span>${groupLabels[columnGroup]}</span>
+          </label>
+          <span class="custom-group-column-count">${selectedCount}/${groupMetas.length}</span>
+        </div>
+        <div class="custom-group-column-options">${columnItems}</div>
+      </section>
+    `;
+  }).join('');
 }
 
 function reloadForColumns() {
@@ -501,25 +520,23 @@ function renderCustomColumnGroups(metas: ColumnMeta[], hidden: Set<string>) {
   }).join('') : '<div class="custom-column-empty">未配置自定义分组</div>';
   const editorRows = groups.map((group, index) => `
     <div class="custom-group-form-row" data-custom-group-form-index="${index}">
-      <label>
-        <span>分组名</span>
-        <input data-custom-field="name" value="${escapeHtml(group.name)}" />
-      </label>
-      <label>
-        <span>列名</span>
-        <textarea data-custom-field="columns" spellcheck="false">${escapeHtml(customGroupInputValue(group.columns || group.keys))}</textarea>
-      </label>
-      <label>
-        <span>关键词</span>
-        <textarea data-custom-field="match" spellcheck="false">${escapeHtml(customGroupInputValue(group.match))}</textarea>
-      </label>
-      <button type="button" data-column-action="custom-delete" data-custom-group-index="${index}">删除</button>
+      <div class="custom-group-form-row-head">
+        <label>
+          <span>分组名</span>
+          <input data-custom-field="name" value="${escapeHtml(group.name)}" />
+        </label>
+        <span class="custom-group-form-count" data-custom-form-count>0/${metas.length} 列</span>
+        <button type="button" data-column-action="custom-delete" data-custom-group-index="${index}">删除</button>
+      </div>
+      <div class="custom-group-column-picker">
+        ${renderCustomGroupColumnPicker(group, metas)}
+      </div>
     </div>
   `).join('');
   const editor = customColumnGroupEditorOpen ? `
     <div class="custom-column-editor">
       <div class="custom-group-form-head">
-        <span>每行填写一个列名或关键词</span>
+        <span>勾选列来定义分组</span>
         <div class="custom-column-editor-actions">
           <button type="button" data-column-action="custom-add">新增分组</button>
           <button type="button" data-column-action="custom-save-form">保存分组</button>
@@ -550,6 +567,7 @@ function renderCustomColumnGroups(metas: ColumnMeta[], hidden: Set<string>) {
 
 function renderCustomGroupPanel() {
   customGroupPanelEl.innerHTML = renderCustomColumnGroups(buildColumnMeta(), getHiddenColumnKeys());
+  customGroupPanelEl.querySelectorAll<HTMLElement>('.custom-group-form-row').forEach(updateCustomGroupFormCounts);
 }
 
 function renderColumnPanel() {
@@ -1802,10 +1820,30 @@ function customGroupConfigFromForm() {
     version: 1,
     groups: rows.map((row) => {
       const name = (row.querySelector<HTMLInputElement>('[data-custom-field="name"]')?.value || '').trim();
-      const columns = customGroupInputList(row.querySelector<HTMLTextAreaElement>('[data-custom-field="columns"]')?.value || '');
-      const match = customGroupInputList(row.querySelector<HTMLTextAreaElement>('[data-custom-field="match"]')?.value || '');
-      return { name, columns, match };
+      const columns = [...row.querySelectorAll<HTMLInputElement>('input[data-custom-column-label]:checked')]
+        .map((input) => input.dataset.customColumnLabel || '')
+        .filter(Boolean);
+      return { name, columns };
     }),
+  });
+}
+
+function updateCustomGroupFormCounts(row: HTMLElement) {
+  const allInputs = [...row.querySelectorAll<HTMLInputElement>('input[data-custom-column-label]')];
+  const checkedCount = allInputs.filter((input) => input.checked).length;
+  const formCountEl = row.querySelector<HTMLElement>('[data-custom-form-count]');
+  if (formCountEl) formCountEl.textContent = `${checkedCount}/${allInputs.length} 列`;
+
+  row.querySelectorAll<HTMLElement>('.custom-group-column-section').forEach((section) => {
+    const sectionInputs = [...section.querySelectorAll<HTMLInputElement>('input[data-custom-column-label]')];
+    const sectionChecked = sectionInputs.filter((input) => input.checked).length;
+    const toggle = section.querySelector<HTMLInputElement>('input[data-custom-section-toggle]');
+    const countEl = section.querySelector<HTMLElement>('.custom-group-column-count');
+    if (toggle) {
+      toggle.checked = sectionInputs.length > 0 && sectionChecked === sectionInputs.length;
+      toggle.indeterminate = sectionChecked > 0 && sectionChecked < sectionInputs.length;
+    }
+    if (countEl) countEl.textContent = `${sectionChecked}/${sectionInputs.length}`;
   });
 }
 
@@ -1839,13 +1877,13 @@ async function handleCustomGroupAction(button: HTMLButtonElement) {
     return;
   }
   if (action === 'custom-add') {
-    customColumnGroups = normalizeCustomColumnGroups({
+    customColumnGroups = {
       version: 1,
       groups: [
         ...(customColumnGroups.groups || []),
-        { name: '新分组', columns: [], match: ['随访'] },
+        { name: '新分组', columns: [] },
       ],
-    });
+    };
     customColumnGroupEditorOpen = true;
     renderCustomGroupPanel();
     customGroupPanelEl.classList.remove('hidden');
@@ -1935,7 +1973,25 @@ customGroupPanelEl.addEventListener('click', (event) => {
 
 customGroupPanelEl.addEventListener('change', (event) => {
   const input = event.target instanceof HTMLInputElement ? event.target : null;
-  if (!input || input.dataset.customGroupToggle === undefined) return;
+  if (!input) return;
+
+  if (input.dataset.customSectionToggle !== undefined) {
+    const section = input.closest<HTMLElement>('.custom-group-column-section');
+    const row = input.closest<HTMLElement>('.custom-group-form-row');
+    section?.querySelectorAll<HTMLInputElement>('input[data-custom-column-label]').forEach((item) => {
+      item.checked = input.checked;
+    });
+    if (row) updateCustomGroupFormCounts(row);
+    return;
+  }
+
+  if (input.dataset.customColumnLabel !== undefined) {
+    const row = input.closest<HTMLElement>('.custom-group-form-row');
+    if (row) updateCustomGroupFormCounts(row);
+    return;
+  }
+
+  if (input.dataset.customGroupToggle === undefined) return;
   const index = Number(input.dataset.customGroupToggle);
   const group = customColumnGroups.groups[index];
   if (!group) return;
