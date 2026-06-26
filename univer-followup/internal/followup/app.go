@@ -1321,9 +1321,6 @@ func (a *app) refreshFromSeaTable() (map[string]any, error) {
 	for _, row := range append(append(patients, drugs...), followups...) {
 		delete(row, "_id")
 	}
-	sortRows(patients)
-	sortRows(drugs)
-	sortRows(followups)
 	payload := map[string]any{
 		"generated_at":     time.Now().Format(time.RFC3339),
 		"source":           "SeaTable:" + firstNonEmpty(a.resolvedBaseName(), names["primary"]),
@@ -1350,20 +1347,6 @@ func cellString(value any) string {
 		return ""
 	}
 	return strings.TrimSpace(fmt.Sprint(value))
-}
-
-func sortRows(rows []map[string]any) {
-	sort.Slice(rows, func(i, j int) bool {
-		return sortKey(rows[i]) < sortKey(rows[j])
-	})
-}
-
-func sortKey(row map[string]any) string {
-	source := 0
-	if n, err := strconv.Atoi(fmt.Sprint(row["source_row"])); err == nil {
-		source = n
-	}
-	return fmt.Sprintf("%010d|%s|%s|%s", source, row["patient_id"], row["药物组合"], row["随访节点"])
 }
 
 func (a *app) savePayload(payload map[string]any, snapshot any) (string, error) {
