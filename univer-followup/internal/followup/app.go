@@ -184,7 +184,8 @@ func (a *app) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, apiError{OK: false, Error: err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "payload": payload, "counts": payloadCounts(payload), "preserved": false})
+	state, _ := a.remoteState()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "payload": payload, "counts": payloadCounts(payload), "preserved": false, "state": state})
 }
 
 func (a *app) handleSave(w http.ResponseWriter, r *http.Request) {

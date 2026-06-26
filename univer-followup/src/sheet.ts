@@ -65,7 +65,7 @@ interface FollowupPayload {
 const HEADER_ROWS = 3;
 const EXTRA_EMPTY_ROWS = 5;
 const HIDDEN_COLUMNS_KEY = 'hidden_columns_v2';
-const REMOTE_POLL_INTERVAL_MS = 15000;
+const REMOTE_POLL_INTERVAL_MS = 60000;
 const SELF_SAVE_GRACE_MS = 12000;
 const RAW_HEADER_ROWS = 1;
 const RAW_SHEET_PREFIX = 'seatable-raw-';
@@ -1289,6 +1289,7 @@ async function saveCurrentWorkbook(mode: '手动' | '自动', finishEditing: boo
       statusEl.textContent = '实时同步中';
       return;
     }
+    if (await refreshBeforeSaveIfNeeded(hash)) return;
     const payload = payloadFromSnapshot(snapshot, currentPayload);
     const response = await fetch('/api/save', {
       method: 'POST',
@@ -1343,6 +1344,7 @@ async function refreshFromSeaTable(mode: '手动' | '自动') {
     const payload = result.payload as FollowupPayload;
     if (!payload) throw new Error('刷新结果缺少 payload');
     const counts = result.counts || {};
+    if (result.state?.signature) lastRemoteSignature = result.state.signature;
     isRefreshing = false;
     mountWorkbook(payload, `SeaTable 已同步 · 患者 ${counts.patients || 0} · 药敏 ${counts.drugs || 0} · 随访 ${counts.followups || 0}`);
   } catch (error) {
@@ -1366,6 +1368,40 @@ async function pollRemoteState() {
   return result.state || {};
 }
 
+async function refreshBeforeSaveIfNeeded(currentHash: string) {
+  const state = await pollRemoteState();
+  const signature = state.signature || '';
+  if (!signature || signature === lastRemoteSignature) return false;
+  if (Date.now() - lastLocalSaveAt < SELF_SAVE_GRACE_MS) {
+    lastRemoteSignature = signature;
+    return false;
+  }
+  if (currentHash === lastSavedWorkbookHash) {
+    lastRemoteSignature = signature;
+    await refreshFromSeaTable('自动');
+    return true;
+  }
+  throw new Error('SeaTable 已有新版本，本地也有未保存修改；自动同步已暂停，避免覆盖 SeaTable 新数据');
+}
+
+async function refreshIfRemoteChanged() {
+  if (!currentPayload || !activeWorkbook()) return;
+  if (isSaving || isRefreshing) return;
+  const state = await pollRemoteState();
+  const signature = state.signature || '';
+  if (!signature || signature === lastRemoteSignature) return;
+  if (Date.now() - lastLocalSaveAt < SELF_SAVE_GRACE_MS) {
+    lastRemoteSignature = signature;
+    return;
+  }
+  const snapshot = await workbookSnapshot(false);
+  if (workbookHash(snapshot) !== lastSavedWorkbookHash) {
+    statusEl.textContent = 'SeaTable 有更新，本地也有未保存修改，自动同步暂停';
+    return;
+  }
+  await refreshFromSeaTable('自动');
+}
+
 function startRealtimeSync() {
   if (currentPayload && !hasRawTables(currentPayload) && !expanded && !workbookHeaders(currentPayload).length) {
     statusEl.textContent = '摘要视图已加载，在列显示中切换到药敏明细后启用实时写回';
@@ -1385,21 +1421,8 @@ function startRealtimeSync() {
   }, 3000);
 
   syncPollTimer = window.setInterval(async () => {
-    if (isSaving || isRefreshing) return;
     try {
-      const state = await pollRemoteState();
-      const signature = state.signature || '';
-      if (!signature || signature === lastRemoteSignature) return;
-      if (Date.now() - lastLocalSaveAt < SELF_SAVE_GRACE_MS) {
-        lastRemoteSignature = signature;
-        return;
-      }
-      const snapshot = await workbookSnapshot(false);
-      if (workbookHash(snapshot) !== lastSavedWorkbookHash) {
-        statusEl.textContent = 'SeaTable 有更新，本地也有未保存修改';
-        return;
-      }
-      await refreshFromSeaTable('自动');
+      await refreshIfRemoteChanged();
     } catch (error) {
       statusEl.textContent = 'SeaTable 远端检查失败';
     }
@@ -1477,6 +1500,19 @@ saveSyncEl.addEventListener('click', async () => {
 
 refreshSyncEl.addEventListener('click', async () => {
   await refreshFromSeaTable('手动');
+});
+
+window.addEventListener('focus', () => {
+  refreshIfRemoteChanged().catch(() => {
+    statusEl.textContent = 'SeaTable 远端检查失败';
+  });
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  refreshIfRemoteChanged().catch(() => {
+    statusEl.textContent = 'SeaTable 远端检查失败';
+  });
 });
 
 reloadEl.addEventListener('click', () => {
