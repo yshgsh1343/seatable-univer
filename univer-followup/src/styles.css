@@ -42,7 +42,15 @@ select {
   min-width: 0;
 }
 
+.brand-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
 .title {
+  flex: 0 0 auto;
   font-size: 18px;
   font-weight: 700;
 }
@@ -86,6 +94,7 @@ button {
 }
 
 input,
+select,
 textarea {
   box-sizing: border-box;
   border: 1px solid #cbd5e1;
@@ -98,6 +107,23 @@ textarea {
 input {
   height: 32px;
   padding: 0 10px;
+}
+
+select {
+  height: 32px;
+  padding: 0 34px 0 10px;
+}
+
+.raw-table-switch {
+  width: min(320px, 36vw);
+  max-width: 100%;
+  color: #172033;
+  font-size: 13px;
+}
+
+.raw-table-switch:disabled {
+  color: #64748b;
+  cursor: default;
 }
 
 textarea {
@@ -1093,6 +1119,18 @@ button:hover {
     align-items: flex-start;
     padding-top: 10px;
     padding-bottom: 10px;
+  }
+
+  .brand {
+    width: 100%;
+  }
+
+  .brand-main {
+    flex-wrap: wrap;
+  }
+
+  .raw-table-switch {
+    width: min(100%, 360px);
   }
 
   .actions {

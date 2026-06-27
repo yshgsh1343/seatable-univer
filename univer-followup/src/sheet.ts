@@ -74,6 +74,7 @@ const RAW_SHEET_PREFIX = 'seatable-raw-';
 const expanded = localStorage.getItem('drug_columns_collapsed') === '0';
 
 const summaryEl = document.getElementById('summary')!;
+const rawTableSwitchEl = document.getElementById('rawTableSwitch') as HTMLSelectElement;
 const statusEl = document.getElementById('status')!;
 const reloadEl = document.getElementById('reloadFull') as HTMLButtonElement;
 const saveSyncEl = document.getElementById('saveSync') as HTMLButtonElement;
@@ -90,6 +91,7 @@ let lastSavedWorkbookHash = '';
 let lastRemoteSignature = '';
 let lastLocalSaveAt = 0;
 let currentUniver: any = null;
+let activeSheetSubscription: { unsubscribe?: () => void; dispose?: () => void } | null = null;
 let syncInitTimer: number | null = null;
 let syncPollTimer: number | null = null;
 let syncAutoSaveTimer: number | null = null;
@@ -1089,6 +1091,73 @@ function hasRawTables(payload: FollowupPayload) {
   return Array.isArray(payload.raw_tables) && payload.raw_tables.length > 0;
 }
 
+function rawTableIndexFromSheetId(sheetId: string) {
+  if (!sheetId.startsWith(RAW_SHEET_PREFIX)) return -1;
+  const index = Number(sheetId.slice(RAW_SHEET_PREFIX.length));
+  return Number.isInteger(index) ? index : -1;
+}
+
+function updateRawTableSwitch(payload: FollowupPayload) {
+  rawTableSwitchEl.replaceChildren();
+  const tables = payload.raw_tables || [];
+  if (!hasRawTables(payload)) {
+    rawTableSwitchEl.hidden = true;
+    rawTableSwitchEl.disabled = true;
+    return;
+  }
+  tables.forEach((table, index) => {
+    const option = document.createElement('option');
+    option.value = String(index);
+    option.textContent = `${table.name || `SeaTable ${index + 1}`} (${table.rows?.length || 0})`;
+    rawTableSwitchEl.appendChild(option);
+  });
+  rawTableSwitchEl.hidden = false;
+  rawTableSwitchEl.disabled = tables.length < 2;
+  rawTableSwitchEl.value = '0';
+}
+
+function syncRawTableSwitchValue(sheetId?: string) {
+  if (!currentPayload || !hasRawTables(currentPayload) || !sheetId) return;
+  const index = rawTableIndexFromSheetId(sheetId);
+  if (index >= 0 && currentPayload.raw_tables?.[index]) {
+    rawTableSwitchEl.value = String(index);
+  }
+}
+
+function clearActiveSheetSubscription() {
+  activeSheetSubscription?.unsubscribe?.();
+  activeSheetSubscription?.dispose?.();
+  activeSheetSubscription = null;
+}
+
+function bindRawTableSwitchToActiveSheet() {
+  clearActiveSheetSubscription();
+  if (!currentPayload || !hasRawTables(currentPayload)) return;
+  const workbook = activeWorkbook();
+  const activeSheet = workbook?.getActiveSheet?.();
+  syncRawTableSwitchValue(activeSheet?.getSheetId?.());
+  activeSheetSubscription = workbook?.getWorkbook?.()?.activeSheet$?.subscribe?.((sheet: any) => {
+    syncRawTableSwitchValue(sheet?.getSheetId?.());
+  }) || null;
+}
+
+function activateRawTable(index: number) {
+  if (!currentPayload || !hasRawTables(currentPayload) || !Number.isInteger(index)) return;
+  const table = currentPayload.raw_tables?.[index];
+  if (!table) return;
+  const sheetId = rawSheetId(index);
+  try {
+    const workbook = activeWorkbook();
+    if (!workbook?.setActiveSheet) throw new Error('当前工作簿不支持表切换');
+    workbook.setActiveSheet(sheetId);
+    syncRawTableSwitchValue(sheetId);
+    setSyncStatus(`已切换到 ${table.name || `SeaTable ${index + 1}`}`);
+  } catch (error) {
+    setSyncStatus('切换表失败');
+    summaryEl.textContent = error instanceof Error ? error.message : String(error);
+  }
+}
+
 function rawPayloadHasNewRows(payload: FollowupPayload) {
   const changed = new Set(payload.changed_raw_tables || []);
   return (payload.raw_tables || []).some((table) => {
@@ -1574,6 +1643,7 @@ function syncSummary(payload: FollowupPayload, suffix: string) {
 
 function updatePayloadSummary(payload: FollowupPayload, suffix = '') {
   currentPayload = payload;
+  updateRawTableSwitch(payload);
   summaryEl.hidden = false;
   const tail = suffix ? ` · ${suffix}` : '';
   if (hasRawTables(payload)) {
@@ -1676,6 +1746,8 @@ async function saveCurrentWorkbook(mode: '手动' | '自动', finishEditing: boo
 
 async function refreshFromSeaTable(mode: '手动' | '自动') {
   if (isRefreshing) return;
+  const restartSyncOnFailure = syncInitTimer !== null || syncPollTimer !== null || syncAutoSaveTimer !== null;
+  stopRealtimeSync();
   isRefreshing = true;
   try {
     if (mode === '手动') refreshSyncEl.disabled = true;
@@ -1692,11 +1764,15 @@ async function refreshFromSeaTable(mode: '手动' | '自动') {
     const counts = result.counts || {};
     if (result.state?.signature) lastRemoteSignature = result.state.signature;
     isRefreshing = false;
-    mountWorkbook(payload, `SeaTable 已同步 · 患者 ${counts.patients || 0} · 药敏 ${counts.drugs || 0} · 随访 ${counts.followups || 0}`);
+    const status = hasRawTables(payload)
+      ? `SeaTable 已同步 · ${payload.raw_tables?.length || 0} 张表 · ${(payload.raw_tables || []).reduce((sum, table) => sum + (table.rows?.length || 0), 0)} 行`
+      : `SeaTable 已同步 · 患者 ${counts.patients || 0} · 药敏 ${counts.drugs || 0} · 随访 ${counts.followups || 0}`;
+    mountWorkbook(payload, status);
   } catch (error) {
     isRefreshing = false;
     setSyncStatus('刷新失败');
     summaryEl.textContent = error instanceof Error ? error.message : String(error);
+    if (restartSyncOnFailure && currentPayload && activeWorkbook()) startRealtimeSync();
     if (mode === '手动') refreshSyncEl.disabled = false;
   } finally {
     if (mode === '手动') refreshSyncEl.disabled = false;
@@ -1779,6 +1855,7 @@ function startRealtimeSync() {
 
 function mountWorkbook(payload: FollowupPayload, status: string) {
   stopRealtimeSync();
+  clearActiveSheetSubscription();
   try {
     currentUniver?.dispose?.();
   } catch {
@@ -1826,6 +1903,7 @@ function mountWorkbook(payload: FollowupPayload, status: string) {
   currentUniver = univer;
   (window as any).univer = univer;
   (window as any).univerAPI = FUniver.newAPI(univer);
+  bindRawTableSwitchToActiveSheet();
   registerContextMenuActions();
   setSyncStatus(status || '初始化中');
   startRealtimeSync();
@@ -1841,7 +1919,8 @@ async function boot() {
   saveSyncEl.hidden = true;
   await loadCustomColumnGroups();
   const payload: FollowupPayload = await fetch('/followup.json').then((response) => response.json());
-  mountWorkbook(payload, '已加载，正在初始化同步');
+  mountWorkbook(payload, '已加载，正在从 SeaTable 同步');
+  void refreshFromSeaTable('自动');
 }
 
 saveSyncEl.addEventListener('click', async () => {
@@ -1850,6 +1929,10 @@ saveSyncEl.addEventListener('click', async () => {
 
 refreshSyncEl.addEventListener('click', async () => {
   await refreshFromSeaTable('手动');
+});
+
+rawTableSwitchEl.addEventListener('change', () => {
+  activateRawTable(Number(rawTableSwitchEl.value));
 });
 
 window.addEventListener('focus', () => {

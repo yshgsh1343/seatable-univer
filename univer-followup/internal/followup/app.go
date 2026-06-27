@@ -706,7 +706,13 @@ func (a *app) remoteState() (map[string]any, error) {
 	}
 	parts := []string{latest}
 	for _, table := range tables {
-		parts = append(parts, strconv.Itoa(counts[table]))
+		var columns []string
+		for _, col := range tableColumnDefs(meta, table) {
+			if name, _ := col["name"].(string); name != "" {
+				columns = append(columns, name)
+			}
+		}
+		parts = append(parts, table, strings.Join(columns, ","), strconv.Itoa(counts[table]))
 	}
 	return map[string]any{"latest_mtime": latest, "counts": counts, "signature": strings.Join(parts, "|")}, nil
 }
@@ -800,6 +806,32 @@ func (a *app) namedRows(token string, meta map[string]any, tableName string) ([]
 		rows = append(rows, named)
 	}
 	return rows, nil
+}
+
+func (a *app) rawTablesFromSeaTable(token string, meta map[string]any) ([]map[string]any, error) {
+	var tables []map[string]any
+	for _, table := range asRows(meta["tables"]) {
+		name, _ := table["name"].(string)
+		if name == "" {
+			continue
+		}
+		var columns []string
+		for _, col := range asRows(table["columns"]) {
+			if colName, _ := col["name"].(string); colName != "" {
+				columns = append(columns, colName)
+			}
+		}
+		rows, err := a.namedRows(token, meta, name)
+		if err != nil {
+			return nil, err
+		}
+		tables = append(tables, map[string]any{
+			"name":    name,
+			"columns": columns,
+			"rows":    rows,
+		})
+	}
+	return tables, nil
 }
 
 func (a *app) upsertRow(token, tableName, rowID string, row map[string]any) error {
@@ -920,15 +952,15 @@ func markPresent(keys map[string]bool, key string) {
 
 func (a *app) snapshotSeaTableState(token string, meta map[string]any) {
 	_ = os.MkdirAll(a.cfg.backupDir, 0755)
-	names := a.targetTableNames(meta)
 	tables := map[string]any{}
-	for _, table := range names {
-		if table == "" {
+	for _, table := range asRows(meta["tables"]) {
+		name, _ := table["name"].(string)
+		if name == "" {
 			continue
 		}
-		rows, err := a.namedRows(token, meta, table)
+		rows, err := a.namedRows(token, meta, name)
 		if err == nil {
-			tables[table] = rows
+			tables[name] = rows
 		}
 	}
 	snapshot := map[string]any{
@@ -1332,6 +1364,33 @@ func deriveStructuredChildren(patients []map[string]any, headers []string) ([]ma
 }
 
 func (a *app) refreshFromSeaTable() (map[string]any, error) {
+	token, err := a.seatableAccessToken()
+	if err != nil {
+		return nil, err
+	}
+	meta, err := a.dtableMetadata(token)
+	if err != nil {
+		return nil, err
+	}
+	rawTables, err := a.rawTablesFromSeaTable(token, meta)
+	if err != nil {
+		return nil, err
+	}
+	payload := map[string]any{
+		"generated_at":       time.Now().Format(time.RFC3339),
+		"source":             "SeaTable:" + a.resolvedBaseName(),
+		"xlsx_headers":       a.xlsxHeaders,
+		"patients":           []map[string]any{},
+		"drug_sensitivity":   []map[string]any{},
+		"followups":          []map[string]any{},
+		"raw_tables":         rawTables,
+		"changed_raw_tables": []string{},
+	}
+	_, err = a.savePayload(payload, nil)
+	return payload, err
+}
+
+func (a *app) refreshStructuredFromSeaTable() (map[string]any, error) {
 	token, err := a.seatableAccessToken()
 	if err != nil {
 		return nil, err
