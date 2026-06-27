@@ -3,6 +3,7 @@ package followup
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -276,8 +277,13 @@ func (a *app) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, apiError{OK: false, Error: err.Error()})
 		return
 	}
-	state, _ := a.remoteState(baseName, workspaceID)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "payload": payload, "counts": payloadCounts(payload), "preserved": false, "state": state})
+	response := map[string]any{"ok": true, "payload": payload, "counts": payloadCounts(payload), "preserved": false}
+	if state, err := a.remoteState(baseName, workspaceID); err == nil {
+		response["state"] = state
+	} else {
+		response["warning"] = err.Error()
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (a *app) handleSave(w http.ResponseWriter, r *http.Request) {
@@ -307,7 +313,7 @@ func (a *app) handleSave(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, apiError{OK: false, Error: err.Error()})
 		return
 	}
-	savedAt, err := a.savePayload(req.Payload, req.Snapshot)
+	savedAt, err := a.savePayload(req.Payload, req.Snapshot, req.BaseName, req.WorkspaceID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, apiError{OK: false, Error: err.Error()})
 		return
@@ -564,6 +570,38 @@ func (a *app) resolveWorkspaceID(workspaceID string) string {
 
 func baseCacheKey(workspaceID, baseName string) string {
 	return workspaceID + "\x00" + baseName
+}
+
+func basePayloadFilename(workspaceID, baseName string) string {
+	sum := sha1.Sum([]byte(baseCacheKey(strings.TrimSpace(workspaceID), strings.TrimSpace(baseName))))
+	return fmt.Sprintf("%x.json", sum[:8])
+}
+
+func (a *app) basePayloadPath(rootJSON, baseName, workspaceID string) string {
+	return filepath.Join(filepath.Dir(rootJSON), "base-cache", basePayloadFilename(workspaceID, baseName))
+}
+
+func (a *app) payloadReadPaths(baseName, workspaceID string) []string {
+	baseName = a.resolveBaseName(baseName)
+	workspaceID = a.resolveWorkspaceID(workspaceID)
+	var paths []string
+	if baseName != "" {
+		paths = append(paths,
+			a.basePayloadPath(a.cfg.publicJSON, baseName, workspaceID),
+			a.basePayloadPath(a.cfg.distJSON, baseName, workspaceID),
+		)
+	}
+	paths = append(paths, a.cfg.publicJSON, a.cfg.distJSON)
+	seen := map[string]bool{}
+	out := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if path == "" || seen[path] {
+			continue
+		}
+		seen[path] = true
+		out = append(out, path)
+	}
+	return out
 }
 
 func stringValue(value any) string {
@@ -915,6 +953,17 @@ func tableColumns(meta map[string]any, tableName string) map[string]string {
 	return out
 }
 
+func tableColumnDefsByName(meta map[string]any, tableName string) map[string]map[string]any {
+	out := map[string]map[string]any{}
+	for _, col := range tableColumnDefs(meta, tableName) {
+		name, _ := col["name"].(string)
+		if name != "" {
+			out[name] = col
+		}
+	}
+	return out
+}
+
 func readableValue(value any, column map[string]any) string {
 	if value == nil {
 		return ""
@@ -1056,6 +1105,42 @@ func compactRow(row map[string]any, columns map[string]string) map[string]any {
 	return out
 }
 
+func compactRawRow(row map[string]any, columns map[string]string, columnDefs map[string]map[string]any) map[string]any {
+	out := compactRow(row, columns)
+	for name, value := range out {
+		out[name] = coerceWritableValue(value, columnDefs[name])
+	}
+	return out
+}
+
+func coerceWritableValue(value any, column map[string]any) any {
+	text, ok := value.(string)
+	if !ok || column == nil {
+		return value
+	}
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return ""
+	}
+	colType, _ := column["type"].(string)
+	switch colType {
+	case "number", "rate":
+		normalized := strings.ReplaceAll(trimmed, ",", "")
+		number, err := strconv.ParseFloat(normalized, 64)
+		if err == nil {
+			return number
+		}
+	case "checkbox":
+		switch strings.ToLower(trimmed) {
+		case "1", "true", "yes", "y", "是", "✓", "checked":
+			return true
+		case "0", "false", "no", "n", "否", "✗", "unchecked":
+			return false
+		}
+	}
+	return value
+}
+
 func comparableCell(value any) string {
 	if value == nil {
 		return ""
@@ -1121,10 +1206,98 @@ func existingRowID(rows map[string]map[string]any, key string) string {
 	return fmt.Sprint(row["_id"])
 }
 
-func markPresent(keys map[string]bool, key string) {
-	if strings.TrimSpace(key) != "" {
-		keys[key] = true
+func rawTableColumns(rawTable map[string]any) []string {
+	seen := map[string]bool{}
+	var columns []string
+	add := func(value any) {
+		name := strings.TrimSpace(fmt.Sprint(value))
+		if name == "" || strings.HasPrefix(name, "_") || seen[name] {
+			return
+		}
+		seen[name] = true
+		columns = append(columns, name)
 	}
+	for _, column := range asAnySlice(rawTable["columns"]) {
+		add(column)
+	}
+	if len(seen) == 0 {
+		var inferred []string
+		for _, row := range asRows(rawTable["rows"]) {
+			for key := range row {
+				if name := strings.TrimSpace(key); name != "" && !strings.HasPrefix(name, "_") {
+					inferred = append(inferred, name)
+				}
+			}
+		}
+		sort.Strings(inferred)
+		for _, key := range inferred {
+			add(key)
+		}
+	}
+	return columns
+}
+
+func addDeletedRowIDs(out map[string]bool, value any) {
+	for _, item := range asAnySlice(value) {
+		id := strings.TrimSpace(fmt.Sprint(item))
+		if id != "" {
+			out[id] = true
+		}
+	}
+}
+
+func deletedRawRowIDs(payload map[string]any, tableName string) map[string]bool {
+	out := map[string]bool{}
+	switch raw := payload["deleted_raw_rows"].(type) {
+	case map[string]any:
+		addDeletedRowIDs(out, raw[tableName])
+	case map[string][]string:
+		addDeletedRowIDs(out, raw[tableName])
+	default:
+		for _, item := range asAnySlice(raw) {
+			row, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			if strings.TrimSpace(fmt.Sprint(row["table"])) != tableName && strings.TrimSpace(fmt.Sprint(row["table_name"])) != tableName {
+				continue
+			}
+			id := firstNonEmpty(strings.TrimSpace(fmt.Sprint(row["row_id"])), strings.TrimSpace(fmt.Sprint(row["_id"])))
+			if id != "" {
+				out[id] = true
+			}
+		}
+	}
+	return out
+}
+
+func (a *app) ensureTextColumns(token, tableName string, columns map[string]string, desired []string, baseName, workspaceID string) (map[string]string, int, error) {
+	created := 0
+	uuid := ""
+	for _, column := range desired {
+		column = strings.TrimSpace(column)
+		if column == "" || strings.HasPrefix(column, "_") || columns[column] != "" {
+			continue
+		}
+		if uuid == "" {
+			var err error
+			uuid, err = a.seatableBaseUUID(baseName, workspaceID)
+			if err != nil {
+				return columns, created, err
+			}
+		}
+		payload := map[string]any{
+			"table_name":  tableName,
+			"column_name": column,
+			"column_type": "text",
+		}
+		if _, err := a.seatableAPI("/api/v1/dtables/"+uuid+"/columns/", http.MethodPost, payload, token, true); err != nil {
+			return columns, created, fmt.Errorf("创建 SeaTable 列 %s.%s 失败: %w", tableName, column, err)
+		}
+		columns[column] = column
+		created++
+	}
+	return columns, created, nil
 }
 
 func (a *app) snapshotSeaTableState(token string, meta map[string]any, baseName, workspaceID string) {
@@ -1199,19 +1372,24 @@ func (a *app) syncToSeaTable(payload map[string]any, baseName, workspaceID strin
 	drugTable := names["drug"]
 	followupTable := names["followup"]
 	a.snapshotSeaTableState(token, meta, baseName, workspaceID)
-	rawTables, rawUpdatedRows, rawDeletedRows, err := a.syncRawTablesToSeaTable(token, meta, payload, baseName, workspaceID)
+	rawTables, rawUpdatedRows, rawDeletedRows, rawCreatedColumns, err := a.syncRawTablesToSeaTable(token, meta, payload, baseName, workspaceID)
 	if err != nil {
 		return nil, err
 	}
 	if rawMode {
-		state, _ := a.remoteState(baseName, workspaceID)
-		return map[string]any{
-			"ok":               true,
-			"raw_tables":       rawTables,
-			"raw_rows":         rawUpdatedRows,
-			"deleted_raw_rows": rawDeletedRows,
-			"state":            state,
-		}, nil
+		response := map[string]any{
+			"ok":                  true,
+			"raw_tables":          rawTables,
+			"raw_rows":            rawUpdatedRows,
+			"deleted_raw_rows":    rawDeletedRows,
+			"created_raw_columns": rawCreatedColumns,
+		}
+		if state, err := a.remoteState(baseName, workspaceID); err == nil {
+			response["state"] = state
+		} else {
+			response["state_warning"] = err.Error()
+		}
+		return response, nil
 	}
 	patientColumns := tableColumns(meta, primaryTable)
 	drugColumns := tableColumns(meta, drugTable)
@@ -1231,11 +1409,9 @@ func (a *app) syncToSeaTable(payload map[string]any, baseName, workspaceID strin
 			rows[id] = row
 		}
 	}
-	seenPatients := map[string]bool{}
 	updatedPatients, deletedPatients, skippedPatients, skipped := 0, 0, 0, 0
 	for _, patient := range asRows(payload["patients"]) {
 		patientID := fmt.Sprint(patient["patient_id"])
-		markPresent(seenPatients, patientID)
 		rowID := ""
 		existingPatient := rows[patientID]
 		if existingPatient != nil {
@@ -1261,24 +1437,17 @@ func (a *app) syncToSeaTable(payload map[string]any, baseName, workspaceID strin
 		}
 		updatedPatients++
 	}
-	for patientID, row := range rows {
-		if seenPatients[patientID] {
-			continue
-		}
-		if err := a.deleteRow(token, primaryTable, fmt.Sprint(row["_id"]), baseName, workspaceID); err != nil {
-			return nil, err
-		}
-		deletedPatients++
-	}
 	existingDrugs := map[string]map[string]any{}
 	if drugTable != "" {
-		rows, _ := a.namedRows(token, meta, drugTable, baseName, workspaceID)
+		rows, err := a.namedRows(token, meta, drugTable, baseName, workspaceID)
+		if err != nil {
+			return nil, err
+		}
 		for _, row := range rows {
 			key := fmt.Sprint(row["patient_id"]) + "\x00" + fmt.Sprint(row["药物组合"])
 			existingDrugs[key] = row
 		}
 	}
-	seenDrugs := map[string]bool{}
 	updatedDrugs, deletedDrugs := 0, 0
 	for _, drug := range asRows(payload["drug_sensitivity"]) {
 		if drugTable == "" {
@@ -1292,7 +1461,6 @@ func (a *app) syncToSeaTable(payload map[string]any, baseName, workspaceID strin
 			continue
 		}
 		key := patientID + "\x00" + drugName
-		seenDrugs[key] = true
 		rowID := existingRowID(existingDrugs, key)
 		patch := compactRow(drug, drugColumns)
 		if _, ok := drugColumns["原始值"]; ok && fmt.Sprint(patch["原始值"]) == "" {
@@ -1307,26 +1475,17 @@ func (a *app) syncToSeaTable(payload map[string]any, baseName, workspaceID strin
 		}
 		updatedDrugs++
 	}
-	if drugTable != "" {
-		for key := range existingDrugs {
-			if seenDrugs[key] {
-				continue
-			}
-			if err := a.deleteRow(token, drugTable, existingRowID(existingDrugs, key), baseName, workspaceID); err != nil {
-				return nil, err
-			}
-			deletedDrugs++
-		}
-	}
 	existingFollowups := map[string]map[string]any{}
 	if followupTable != "" {
-		rows, _ := a.namedRows(token, meta, followupTable, baseName, workspaceID)
+		rows, err := a.namedRows(token, meta, followupTable, baseName, workspaceID)
+		if err != nil {
+			return nil, err
+		}
 		for _, row := range rows {
 			key := fmt.Sprint(row["patient_id"]) + "\x00" + fmt.Sprint(row["随访节点"])
 			existingFollowups[key] = row
 		}
 	}
-	seenFollowups := map[string]bool{}
 	updatedFollowups, deletedFollowups := 0, 0
 	for _, followup := range asRows(payload["followups"]) {
 		if followupTable == "" {
@@ -1338,7 +1497,6 @@ func (a *app) syncToSeaTable(payload map[string]any, baseName, workspaceID strin
 			skipped++
 			continue
 		}
-		seenFollowups[key] = true
 		rowID := existingRowID(existingFollowups, key)
 		patch := compactRow(followup, followupColumns)
 		patch = changedNamedPatch(existingFollowups[key], patch)
@@ -1350,36 +1508,30 @@ func (a *app) syncToSeaTable(payload map[string]any, baseName, workspaceID strin
 		}
 		updatedFollowups++
 	}
-	if followupTable != "" {
-		for key := range existingFollowups {
-			if seenFollowups[key] {
-				continue
-			}
-			if err := a.deleteRow(token, followupTable, existingRowID(existingFollowups, key), baseName, workspaceID); err != nil {
-				return nil, err
-			}
-			deletedFollowups++
-		}
+	response := map[string]any{
+		"ok":                  true,
+		"updated":             updatedPatients,
+		"skipped":             skipped + skippedPatients,
+		"patients":            updatedPatients,
+		"drugs":               updatedDrugs,
+		"followups":           updatedFollowups,
+		"deleted_patients":    deletedPatients,
+		"deleted_drugs":       deletedDrugs,
+		"deleted_followups":   deletedFollowups,
+		"raw_tables":          rawTables,
+		"raw_rows":            rawUpdatedRows,
+		"deleted_raw_rows":    rawDeletedRows,
+		"created_raw_columns": rawCreatedColumns,
 	}
-	state, _ := a.remoteState(baseName, workspaceID)
-	return map[string]any{
-		"ok":                true,
-		"updated":           updatedPatients,
-		"skipped":           skipped + skippedPatients,
-		"patients":          updatedPatients,
-		"drugs":             updatedDrugs,
-		"followups":         updatedFollowups,
-		"deleted_patients":  deletedPatients,
-		"deleted_drugs":     deletedDrugs,
-		"deleted_followups": deletedFollowups,
-		"raw_tables":        rawTables,
-		"raw_rows":          rawUpdatedRows,
-		"deleted_raw_rows":  rawDeletedRows,
-		"state":             state,
-	}, nil
+	if state, err := a.remoteState(baseName, workspaceID); err == nil {
+		response["state"] = state
+	} else {
+		response["state_warning"] = err.Error()
+	}
+	return response, nil
 }
 
-func (a *app) syncRawTablesToSeaTable(token string, meta map[string]any, payload map[string]any, baseName, workspaceID string) (int, int, int, error) {
+func (a *app) syncRawTablesToSeaTable(token string, meta map[string]any, payload map[string]any, baseName, workspaceID string) (int, int, int, int, error) {
 	changed := map[string]bool{}
 	for _, name := range asAnySlice(payload["changed_raw_tables"]) {
 		if s := strings.TrimSpace(fmt.Sprint(name)); s != "" {
@@ -1387,7 +1539,7 @@ func (a *app) syncRawTablesToSeaTable(token string, meta map[string]any, payload
 		}
 	}
 	if len(changed) == 0 {
-		return 0, 0, 0, nil
+		return 0, 0, 0, 0, nil
 	}
 	tableExists := map[string]bool{}
 	for _, table := range asRows(meta["tables"]) {
@@ -1398,26 +1550,28 @@ func (a *app) syncRawTablesToSeaTable(token string, meta map[string]any, payload
 	updatedTables := 0
 	updatedRows := 0
 	deletedRows := 0
+	createdColumns := 0
 	for _, rawTable := range asRows(payload["raw_tables"]) {
 		tableName := strings.TrimSpace(fmt.Sprint(rawTable["name"]))
 		if tableName == "" || !changed[tableName] {
 			continue
 		}
 		if !tableExists[tableName] {
-			return updatedTables, updatedRows, deletedRows, fmt.Errorf("SeaTable 表不存在: %s", tableName)
+			return updatedTables, updatedRows, deletedRows, createdColumns, fmt.Errorf("SeaTable 表不存在: %s", tableName)
 		}
 		columns := tableColumns(meta, tableName)
-		rows := asRows(rawTable["rows"])
-		submittedIDs := map[string]bool{}
-		for _, row := range rows {
-			rowID := strings.TrimSpace(fmt.Sprint(row["_id"]))
-			if rowID != "" {
-				submittedIDs[rowID] = true
-			}
+		columnDefs := tableColumnDefsByName(meta, tableName)
+		var created int
+		var err error
+		columns, created, err = a.ensureTextColumns(token, tableName, columns, rawTableColumns(rawTable), baseName, workspaceID)
+		if err != nil {
+			return updatedTables, updatedRows, deletedRows, createdColumns, err
 		}
+		createdColumns += created
+		rows := asRows(rawTable["rows"])
 		currentRows, err := a.gatewayRows(token, tableName, baseName, workspaceID)
 		if err != nil {
-			return updatedTables, updatedRows, deletedRows, err
+			return updatedTables, updatedRows, deletedRows, createdColumns, err
 		}
 		currentRowsByID := map[string]map[string]any{}
 		for _, row := range currentRows {
@@ -1425,29 +1579,31 @@ func (a *app) syncRawTablesToSeaTable(token string, meta map[string]any, payload
 			if rowID != "" {
 				currentRowsByID[rowID] = row
 			}
-			if rowID == "" || submittedIDs[rowID] {
+		}
+		for rowID := range deletedRawRowIDs(payload, tableName) {
+			if _, ok := currentRowsByID[rowID]; !ok {
 				continue
 			}
 			if err := a.deleteRow(token, tableName, rowID, baseName, workspaceID); err != nil {
-				return updatedTables, updatedRows, deletedRows, err
+				return updatedTables, updatedRows, deletedRows, createdColumns, err
 			}
 			deletedRows++
 		}
 		for _, row := range rows {
 			rowID := fmt.Sprint(row["_id"])
-			patch := compactRow(row, columns)
+			patch := compactRawRow(row, columns, columnDefs)
 			patch = changedRawPatch(currentRowsByID[strings.TrimSpace(rowID)], columns, patch)
 			if len(patch) == 0 {
 				continue
 			}
 			if err := a.upsertRow(token, tableName, rowID, patch, baseName, workspaceID); err != nil {
-				return updatedTables, updatedRows, deletedRows, err
+				return updatedTables, updatedRows, deletedRows, createdColumns, err
 			}
 			updatedRows++
 		}
 		updatedTables++
 	}
-	return updatedTables, updatedRows, deletedRows, nil
+	return updatedTables, updatedRows, deletedRows, createdColumns, nil
 }
 
 var (
@@ -1569,7 +1725,7 @@ func (a *app) refreshFromSeaTable(baseName, workspaceID string) (map[string]any,
 		"raw_tables":         rawTables,
 		"changed_raw_tables": []string{},
 	}
-	_, err = a.savePayload(payload, nil)
+	_, err = a.savePayload(payload, nil, baseName, workspaceID)
 	return payload, err
 }
 
@@ -1592,10 +1748,16 @@ func (a *app) refreshStructuredFromSeaTable(baseName, workspaceID string) (map[s
 	drugs := []map[string]any{}
 	followups := []map[string]any{}
 	if names["drug"] != "" {
-		drugs, _ = a.namedRows(token, meta, names["drug"], baseName, workspaceID)
+		drugs, err = a.namedRows(token, meta, names["drug"], baseName, workspaceID)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if names["followup"] != "" {
-		followups, _ = a.namedRows(token, meta, names["followup"], baseName, workspaceID)
+		followups, err = a.namedRows(token, meta, names["followup"], baseName, workspaceID)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if len(drugs) == 0 || len(followups) == 0 {
 		derivedDrugs, derivedFollowups := deriveStructuredChildren(patients, a.xlsxHeaders)
@@ -1619,7 +1781,7 @@ func (a *app) refreshStructuredFromSeaTable(baseName, workspaceID string) (map[s
 		"drug_sensitivity": drugs,
 		"followups":        followups,
 	}
-	_, err = a.savePayload(payload, nil)
+	_, err = a.savePayload(payload, nil, baseName, workspaceID)
 	return payload, err
 }
 
@@ -1639,11 +1801,26 @@ func cellString(value any) string {
 	return strings.TrimSpace(fmt.Sprint(value))
 }
 
-func (a *app) savePayload(payload map[string]any, snapshot any) (string, error) {
+func (a *app) savePayload(payload map[string]any, snapshot any, baseName, workspaceID string) (string, error) {
+	baseName = firstNonEmpty(strings.TrimSpace(baseName), payloadBaseName(payload), a.resolveBaseName(""))
+	workspaceID = firstNonEmpty(strings.TrimSpace(workspaceID), payloadWorkspaceID(payload), a.resolveWorkspaceID(""))
+	if baseName != "" {
+		payload["base_name"] = baseName
+		payload["workspace_id"] = workspaceID
+		payload["source"] = "SeaTable:" + baseName
+	}
 	if payload["generated_at"] == nil {
 		payload["generated_at"] = time.Now().Format(time.RFC3339)
 	}
 	raw, _ := json.MarshalIndent(payload, "", "  ")
+	if baseName != "" {
+		if err := atomicWrite(a.basePayloadPath(a.cfg.publicJSON, baseName, workspaceID), raw); err != nil {
+			return "", err
+		}
+		if err := atomicWrite(a.basePayloadPath(a.cfg.distJSON, baseName, workspaceID), raw); err != nil {
+			return "", err
+		}
+	}
 	if err := atomicWrite(a.cfg.publicJSON, raw); err != nil {
 		return "", err
 	}
@@ -1663,29 +1840,29 @@ func (a *app) savePayload(payload map[string]any, snapshot any) (string, error) 
 }
 
 func (a *app) currentStructuredPayload(baseName, workspaceID string) (map[string]any, bool) {
-	body, err := os.ReadFile(a.cfg.publicJSON)
-	if err != nil {
-		return nil, false
-	}
-	var payload map[string]any
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, false
-	}
-	if len(asRows(payload["raw_tables"])) > 0 {
-		return nil, false
-	}
-	if len(asRows(payload["patients"])) == 0 {
-		return nil, false
-	}
-	if requestedBase := a.resolveBaseName(baseName); requestedBase != "" && payloadBaseName(payload) != requestedBase {
-		return nil, false
-	}
-	if requestedWorkspace := a.resolveWorkspaceID(workspaceID); requestedWorkspace != "" {
-		if payloadWorkspace := payloadWorkspaceID(payload); payloadWorkspace != "" && payloadWorkspace != requestedWorkspace {
-			return nil, false
+	for _, path := range a.payloadReadPaths(baseName, workspaceID) {
+		body, err := os.ReadFile(path)
+		if err != nil {
+			continue
 		}
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			continue
+		}
+		if len(asRows(payload["raw_tables"])) == 0 && len(asRows(payload["patients"])) == 0 {
+			continue
+		}
+		if requestedBase := a.resolveBaseName(baseName); requestedBase != "" && payloadBaseName(payload) != requestedBase {
+			continue
+		}
+		if requestedWorkspace := a.resolveWorkspaceID(workspaceID); requestedWorkspace != "" {
+			if payloadWorkspace := payloadWorkspaceID(payload); payloadWorkspace != "" && payloadWorkspace != requestedWorkspace {
+				continue
+			}
+		}
+		return payload, true
 	}
-	return payload, true
+	return nil, false
 }
 
 func payloadCounts(payload map[string]any) map[string]int {

@@ -72,6 +72,7 @@ interface FollowupPayload {
   followups: FollowupRow[];
   raw_tables?: RawTable[];
   changed_raw_tables?: string[];
+  deleted_raw_rows?: Record<string, string[]>;
 }
 
 const HEADER_ROWS = 2;
@@ -983,22 +984,45 @@ function comparableRawRows(rows: RawRow[], columns: string[]) {
   }));
 }
 
+function rawColumnsFromSnapshot(sheet: any, table: RawTable) {
+  const cells = sheet?.cellData || {};
+  const fallback = table.columns || [];
+  const columnCount = Math.max(sheet?.columnCount || 0, fallback.length + 1);
+  const seen = new Set<string>();
+  const columns: string[] = [];
+
+  for (let col = 1; col < columnCount; col += 1) {
+    const header = cellText(cells[0]?.[col]) || fallback[col - 1] || '';
+    const name = header.trim();
+    if (!name || name === '_id' || seen.has(name)) continue;
+    seen.add(name);
+    columns.push(name);
+  }
+  return columns;
+}
+
 function payloadFromRawSnapshot(snapshot: any, original: FollowupPayload): FollowupPayload {
   const rawTables = original.raw_tables || [];
   const nextTables: RawTable[] = [];
   const changedTables: string[] = [];
+  const markChanged = (name: string) => {
+    if (name && !changedTables.includes(name)) changedTables.push(name);
+  };
 
   rawTables.forEach((table, tableIndex) => {
     const sheet = snapshot?.sheets?.[rawSheetId(tableIndex)];
+    if (!sheet) {
+      nextTables.push(table);
+      return;
+    }
     const cells = sheet?.cellData || {};
-    const columns = table.columns || [];
-    const originalRowsByID = Object.fromEntries((table.rows || []).map((row) => [String(row._id || ''), row]));
+    const columns = rawColumnsFromSnapshot(sheet, table);
     const nextRows: RawRow[] = [];
     const rowCount = sheet?.rowCount || 0;
 
     for (let row = RAW_HEADER_ROWS; row < rowCount; row += 1) {
       const rowID = cellText(cells[row]?.[0]);
-      const values: RawRow = { ...(rowID ? originalRowsByID[rowID] || {} : {}), _id: rowID };
+      const values: RawRow = { _id: rowID };
       let hasValue = Boolean(rowID);
       columns.forEach((column, index) => {
         const value = cellText(cells[row]?.[index + 1]);
@@ -1009,9 +1033,12 @@ function payloadFromRawSnapshot(snapshot: any, original: FollowupPayload): Follo
     }
 
     if (comparableRawRows(nextRows, columns) !== comparableRawRows(table.rows || [], columns)) {
-      changedTables.push(table.name);
+      markChanged(table.name);
     }
-    nextTables.push({ ...table, rows: nextRows });
+    if (JSON.stringify(columns) !== JSON.stringify(table.columns || [])) {
+      markChanged(table.name);
+    }
+    nextTables.push({ ...table, columns, rows: nextRows });
   });
 
   return {
@@ -1772,6 +1799,31 @@ function workbookHash(snapshot: any) {
   }])));
 }
 
+async function rememberWorkbookHash(payload: FollowupPayload) {
+  try {
+    const snapshot = await workbookSnapshot(false);
+    if (currentPayload === payload) lastSavedWorkbookHash = workbookHash(snapshot);
+  } catch {
+    // The realtime sync initializer will retry shortly after mount.
+  }
+}
+
+async function hasUnsavedWorkbookChanges() {
+  if (!currentPayload || !activeWorkbook()) return false;
+  const snapshot = await workbookSnapshot(false);
+  const hash = workbookHash(snapshot);
+  if (!lastSavedWorkbookHash) {
+    lastSavedWorkbookHash = hash;
+    return false;
+  }
+  return hash !== lastSavedWorkbookHash;
+}
+
+async function confirmDiscardUnsaved(message: string) {
+  if (!(await hasUnsavedWorkbookChanges())) return true;
+  return window.confirm(message);
+}
+
 function syncSummary(payload: FollowupPayload, suffix: string) {
   summaryEl.hidden = false;
   if (hasRawTables(payload)) {
@@ -1867,8 +1919,9 @@ async function saveCurrentWorkbook(mode: '手动' | '自动', finishEditing: boo
     const deletedStructured = (result.seatable?.deleted_patients || 0)
       + (result.seatable?.deleted_drugs || 0)
       + (result.seatable?.deleted_followups || 0);
+    const createdRawColumns = result.seatable?.created_raw_columns || 0;
     const seatableText = result.seatable?.ok && hasRawTables(payload)
-      ? `SeaTable 原表 ${result.seatable.raw_tables || 0} 张 · 更新 ${result.seatable.raw_rows || 0} 行 · 删除 ${result.seatable.deleted_raw_rows || 0} 行`
+      ? `SeaTable 原表 ${result.seatable.raw_tables || 0} 张 · 更新 ${result.seatable.raw_rows || 0} 行 · 新增列 ${createdRawColumns} 个 · 删除 ${result.seatable.deleted_raw_rows || 0} 行`
       : result.seatable?.ok
       ? `SeaTable 主表 ${result.seatable.patients || result.seatable.updated || 0} · 药敏 ${result.seatable.drugs || 0} · 随访 ${result.seatable.followups || 0} · 删除 ${deletedStructured}`
       : `SeaTable未写入: ${result.seatable?.error || '未配置'}`;
@@ -1887,8 +1940,12 @@ async function saveCurrentWorkbook(mode: '手动' | '自动', finishEditing: boo
   }
 }
 
-async function refreshFromSeaTable(mode: '手动' | '自动') {
+async function refreshFromSeaTable(mode: '手动' | '自动', options: { skipDirtyCheck?: boolean } = {}) {
   if (isRefreshing) return;
+  if (mode === '手动' && !options.skipDirtyCheck) {
+    const confirmed = await confirmDiscardUnsaved('当前表格有未保存修改，刷新会放弃这些修改，是否继续？');
+    if (!confirmed) return;
+  }
   const restartSyncOnFailure = syncInitTimer !== null || syncPollTimer !== null || syncAutoSaveTimer !== null;
   stopRealtimeSync();
   isRefreshing = true;
@@ -1936,6 +1993,24 @@ async function pollRemoteState() {
   const result = await response.json();
   if (!response.ok || !result.ok) throw new Error(result.error || `HTTP ${response.status}`);
   return result.state || {};
+}
+
+async function loadInitialPayload() {
+  const baseRequest = currentBaseRequest();
+  if (baseRequest.base_name) {
+    try {
+      const response = await fetch('/api/refresh', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ force: false, ...baseRequest }),
+      });
+      const result = await response.json();
+      if (response.ok && result.ok && result.payload) return result.payload as FollowupPayload;
+    } catch {
+      // Fall back to the bundled JSON below.
+    }
+  }
+  return fetch('/followup.json').then((response) => response.json()) as Promise<FollowupPayload>;
 }
 
 async function refreshBeforeSaveIfNeeded(currentHash: string) {
@@ -2054,6 +2129,7 @@ function mountWorkbook(payload: FollowupPayload, status: string) {
   bindRawTableSwitchToActiveSheet();
   registerContextMenuActions();
   setSyncStatus(status || '初始化中');
+  void rememberWorkbookHash(payload);
   startRealtimeSync();
 }
 
@@ -2066,9 +2142,9 @@ async function boot() {
   if (openSheetEl) openSheetEl.hidden = true;
   saveSyncEl.hidden = true;
   await loadCustomColumnGroups();
-  const payload: FollowupPayload = await fetch('/followup.json').then((response) => response.json());
-  currentPayload = payload;
   await loadBaseOptions();
+  const payload = await loadInitialPayload();
+  currentPayload = payload;
   updateBaseSwitch(payload);
   mountWorkbook(payload, '已加载，正在从 SeaTable 同步');
   void refreshFromSeaTable('自动');
@@ -2089,12 +2165,18 @@ rawTableSwitchEl.addEventListener('change', () => {
 baseSwitchEl.addEventListener('change', async () => {
   const nextBase = baseByKey(baseSwitchEl.value);
   if (!nextBase || (selectedBase && baseKey(nextBase) === baseKey(selectedBase))) return;
+  const previousBase = selectedBase;
+  const confirmed = await confirmDiscardUnsaved('当前表格有未保存修改，切换 SeaTable 表格会放弃这些修改，是否继续？');
+  if (!confirmed) {
+    if (previousBase) baseSwitchEl.value = baseKey(previousBase);
+    return;
+  }
   selectedBase = nextBase;
   lastRemoteSignature = '';
   lastSavedWorkbookHash = '';
   lastLocalSaveAt = 0;
   setSyncStatus(`正在切换到 ${nextBase.label || nextBase.name}`);
-  await refreshFromSeaTable('手动');
+  await refreshFromSeaTable('手动', { skipDirtyCheck: true });
 });
 
 window.addEventListener('focus', () => {
