@@ -1,5 +1,5 @@
 import xlsxHeaderTemplate from '../xlsx_headers.json';
-import type { ColumnGroup, ColumnMeta, DetailColumn, FollowupPayload } from './types';
+import type { ColumnGroup, ColumnMeta, DetailColumn, FollowupPayload, RawTable } from './types';
 import { columnAddress, slug } from './sheetUtils';
 
 export const HEADER_ROWS = 2;
@@ -153,6 +153,25 @@ export function xlsxColumnMetaFromHeaders(headers: string[]) {
       groupLabel: groupLabels[group],
       sourceKey: header,
       drugName: header.startsWith('药敏_') ? header.slice(3) : undefined,
+    };
+  });
+}
+
+export function rawColumnKey(tableName: string, columnName: string, index: number) {
+  return `raw.${slug(tableName || 'table')}.${slug(columnName || columnAddress(index))}.${index}`;
+}
+
+export function rawColumnMeta(table: RawTable | undefined) {
+  if (!table) return [];
+  return (table.columns || []).map((column, index) => {
+    const label = String(column || '').trim() || `第${columnAddress(index + 1)}列`;
+    const group = groupForXlsxHeader(label);
+    return {
+      key: rawColumnKey(table.name, label, index),
+      label,
+      group,
+      groupLabel: groupLabels[group],
+      sourceKey: label,
     };
   });
 }

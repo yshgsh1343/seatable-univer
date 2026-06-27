@@ -17,6 +17,7 @@ import {
   imagingColumns,
   molecularColumns,
   pathologyColumns,
+  rawColumnKey,
   workbookHeaders,
 } from './columnModel';
 import { hasRawTables, rawSheetId } from './rawPayload';
@@ -130,10 +131,11 @@ function rawCellStyle(value: string) {
   return value.length > 36 || value.includes('\n') ? 'wrap' : 'body';
 }
 
-function makeRawWorkbook(payload: FollowupPayload) {
+function makeRawWorkbook(payload: FollowupPayload, options: WorkbookOptions) {
   const sheets: Record<string, any> = {};
   const sheetOrder: string[] = [];
   const rawTables = payload.raw_tables || [];
+  const hiddenColumns = options.hiddenColumns;
 
   rawTables.forEach((table, tableIndex) => {
     const id = rawSheetId(tableIndex);
@@ -146,7 +148,7 @@ function makeRawWorkbook(payload: FollowupPayload) {
       put(cells, 0, col, column, 'header');
       if (col > 0) {
         const width = column.length > 12 || column.includes('诊断') || column.includes('结果') || column.includes('记录') ? 220 : 132;
-        columnData[col] = { w: width };
+        columnData[col] = { w: width, hd: hiddenColumns.has(rawColumnKey(table.name, column, col - 1)) ? 1 : 0 };
       }
     });
 
@@ -313,7 +315,7 @@ function workbookStyles(xlsxMode = false) {
 }
 
 export function makeWorkbook(payload: FollowupPayload, options: WorkbookOptions) {
-  if (hasRawTables(payload)) return makeRawWorkbook(payload);
+  if (hasRawTables(payload)) return makeRawWorkbook(payload, options);
   if (workbookHeaders(payload).length) return makeXlsxWorkbook(payload, options);
   const drugMap = byPatient(payload.drug_sensitivity);
   const followupMap = byPatient(payload.followups);

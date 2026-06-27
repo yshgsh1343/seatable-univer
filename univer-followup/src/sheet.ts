@@ -53,6 +53,7 @@ import {
   drugTypes,
   groupLabels,
   groupOrder,
+  rawColumnMeta,
   workbookHeaders as workbookHeadersForPayload,
 } from './columnModel';
 import { payloadFromSnapshot as payloadFromSnapshotForSave } from './payloadTransforms';
@@ -70,6 +71,7 @@ import type {
 import { makeWorkbook as createWorkbook } from './workbookFactory';
 
 const expanded = localStorage.getItem('drug_columns_collapsed') === '0';
+const ACTIVE_RAW_TABLE_KEY = 'active_raw_table_index_v1';
 
 const summaryEl = document.getElementById('summary')!;
 const baseSwitchEl = document.getElementById('baseSwitch') as HTMLSelectElement;
@@ -145,7 +147,23 @@ function workbookHeaders(payload: FollowupPayload | null = currentPayload) {
   return workbookHeadersForPayload(payload);
 }
 
+function activeRawTableIndex() {
+  if (!currentPayload || !hasRawTables(currentPayload)) return -1;
+  const activeSheetId = String(activeWorkbook()?.getActiveSheet?.()?.getSheetId?.() || '');
+  const sheetIndex = rawTableIndexFromSheetId(activeSheetId);
+  if (sheetIndex >= 0 && currentPayload.raw_tables?.[sheetIndex]) return sheetIndex;
+  const switchIndex = Number(rawTableSwitchEl.value);
+  if (Number.isInteger(switchIndex) && currentPayload.raw_tables?.[switchIndex]) return switchIndex;
+  return 0;
+}
+
+function activeRawTableColumnMeta() {
+  if (!currentPayload || !hasRawTables(currentPayload)) return [];
+  return rawColumnMeta(currentPayload.raw_tables?.[activeRawTableIndex()]);
+}
+
 function buildColumnMeta() {
+  if (currentPayload && hasRawTables(currentPayload)) return activeRawTableColumnMeta();
   return buildColumnMetaForPayload(currentPayload, expanded);
 }
 
@@ -392,7 +410,9 @@ function renderColumnPanel() {
   const drugModeAction = workbookHeaders().length ? '' : `
         <button type="button" data-column-action="toggle-drug-detail">${expanded ? '药敏摘要' : '药敏明细'}</button>
   `;
-  const groupShortcutHtml = groupOrder.map((group) => {
+  const visibleGroups = groupOrder.filter((group) => metas.some((meta) => meta.group === group));
+  const panelGroups = visibleGroups.length ? visibleGroups : groupOrder;
+  const groupShortcutHtml = panelGroups.map((group) => {
     const groupMetas = metas.filter((meta) => meta.group === group);
     const visibleCount = groupMetas.filter((meta) => !hidden.has(meta.key)).length;
     const allVisible = groupMetas.length > 0 && visibleCount === groupMetas.length;
@@ -403,7 +423,7 @@ function renderColumnPanel() {
         </label>
     `;
   }).join('');
-  const groupHtml = groupOrder.map((group) => {
+  const groupHtml = panelGroups.map((group) => {
     const groupMetas = metas.filter((meta) => meta.group === group);
     const visibleCount = groupMetas.filter((meta) => !hidden.has(meta.key)).length;
     const allVisible = visibleCount === groupMetas.length;
@@ -563,14 +583,27 @@ function updateRawTableSwitch(payload: FollowupPayload) {
   });
   rawTableSwitchEl.hidden = false;
   rawTableSwitchEl.disabled = tables.length < 2;
-  rawTableSwitchEl.value = '0';
+  const savedIndex = Number(localStorage.getItem(ACTIVE_RAW_TABLE_KEY) || '0');
+  rawTableSwitchEl.value = Number.isInteger(savedIndex) && tables[savedIndex] ? String(savedIndex) : '0';
 }
 
 function syncRawTableSwitchValue(sheetId?: string) {
   if (!currentPayload || !hasRawTables(currentPayload) || !sheetId) return;
   const index = rawTableIndexFromSheetId(sheetId);
   if (index >= 0 && currentPayload.raw_tables?.[index]) {
+    const changed = rawTableSwitchEl.value !== String(index);
     rawTableSwitchEl.value = String(index);
+    localStorage.setItem(ACTIVE_RAW_TABLE_KEY, String(index));
+    if (changed) {
+      lastCustomGroupMetas = [];
+      renderColumnPanel();
+      if (!customGroupPanelEl.classList.contains('hidden')) {
+        renderCustomGroupPanel().catch((error) => {
+          statusEl.textContent = '自定义分组读取列失败';
+          summaryEl.textContent = error instanceof Error ? error.message : String(error);
+        });
+      }
+    }
   }
 }
 
@@ -601,6 +634,15 @@ function activateRawTable(index: number) {
     if (!workbook?.setActiveSheet) throw new Error('当前工作簿不支持表切换');
     workbook.setActiveSheet(sheetId);
     syncRawTableSwitchValue(sheetId);
+    localStorage.setItem(ACTIVE_RAW_TABLE_KEY, String(index));
+    lastCustomGroupMetas = [];
+    renderColumnPanel();
+    if (!customGroupPanelEl.classList.contains('hidden')) {
+      renderCustomGroupPanel().catch((error) => {
+        statusEl.textContent = '自定义分组读取列失败';
+        summaryEl.textContent = error instanceof Error ? error.message : String(error);
+      });
+    }
     setSyncStatus(`已切换到 ${table.name || `SeaTable ${index + 1}`}`);
   } catch (error) {
     setSyncStatus('切换表失败');
@@ -774,12 +816,18 @@ function updatePayloadSummary(payload: FollowupPayload, suffix = '') {
   const tail = suffix ? ` · ${suffix}` : '';
   if (hasRawTables(payload)) {
     const rawRows = (payload.raw_tables || []).reduce((sum, table) => sum + (table.rows?.length || 0), 0);
-    summaryEl.textContent = `${payload.raw_tables?.length || 0} 张 SeaTable 表 · ${rawRows} 行${tail}`;
     [reloadEl, customGroupToggleEl, columnPanelToggleEl].forEach((item) => {
-      item.hidden = true;
+      item.hidden = false;
     });
-    customGroupPanelEl.hidden = true;
-    columnPanelEl.hidden = true;
+    customGroupPanelEl.hidden = false;
+    columnPanelEl.hidden = false;
+    const metas = buildColumnMeta();
+    const hiddenCount = metas.filter((meta) => getHiddenColumnKeys().has(meta.key)).length;
+    summaryEl.textContent = `${payload.raw_tables?.length || 0} 张 SeaTable 表 · ${rawRows} 行 · 当前表隐藏 ${hiddenCount} 列${tail}`;
+    renderCustomGroupPanel().catch(() => {
+      customGroupPanelEl.innerHTML = renderCustomColumnGroups(buildColumnMeta(), getHiddenColumnKeys());
+    });
+    renderColumnPanel();
     return;
   }
   [reloadEl, customGroupToggleEl, columnPanelToggleEl].forEach((item) => {
@@ -1060,6 +1108,10 @@ function mountWorkbook(payload: FollowupPayload, status: string) {
   (window as any).univerAPI = FUniver.newAPI(univer);
   bindRawTableSwitchToActiveSheet();
   registerContextMenuActions();
+  if (hasRawTables(payload)) {
+    const savedIndex = Number(localStorage.getItem(ACTIVE_RAW_TABLE_KEY) || rawTableSwitchEl.value || '0');
+    if (Number.isInteger(savedIndex) && payload.raw_tables?.[savedIndex]) activateRawTable(savedIndex);
+  }
   setSyncStatus(status || '初始化中');
   void rememberWorkbookHash(payload);
   startRealtimeSync();
