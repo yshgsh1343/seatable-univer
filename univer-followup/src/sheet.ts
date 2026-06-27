@@ -52,8 +52,20 @@ interface RawTable {
   rows: RawRow[];
 }
 
+interface SeaTableBase {
+  name: string;
+  workspace_id: string;
+  uuid?: string;
+  label?: string;
+  workspace_name?: string;
+  workspace_type?: string;
+}
+
 interface FollowupPayload {
   generated_at: string;
+  source?: string;
+  base_name?: string;
+  workspace_id?: string;
   xlsx_headers?: string[];
   patients: Patient[];
   drug_sensitivity: DrugRow[];
@@ -74,6 +86,7 @@ const RAW_SHEET_PREFIX = 'seatable-raw-';
 const expanded = localStorage.getItem('drug_columns_collapsed') === '0';
 
 const summaryEl = document.getElementById('summary')!;
+const baseSwitchEl = document.getElementById('baseSwitch') as HTMLSelectElement;
 const rawTableSwitchEl = document.getElementById('rawTableSwitch') as HTMLSelectElement;
 const statusEl = document.getElementById('status')!;
 const reloadEl = document.getElementById('reloadFull') as HTMLButtonElement;
@@ -85,6 +98,8 @@ const customGroupPanelEl = document.getElementById('customGroupPanel')!;
 const columnPanelEl = document.getElementById('columnPanel')!;
 
 let currentPayload: FollowupPayload | null = null;
+let availableBases: SeaTableBase[] = [];
+let selectedBase: SeaTableBase | null = null;
 let isSaving = false;
 let isRefreshing = false;
 let lastSavedWorkbookHash = '';
@@ -247,6 +262,59 @@ function escapeHtml(value: string) {
 
 function slug(value: string) {
   return value.replace(/\s+/g, '-').toLowerCase();
+}
+
+function payloadBaseName(payload: FollowupPayload | null = currentPayload) {
+  const direct = String(payload?.base_name || '').trim();
+  if (direct) return direct;
+  const source = String(payload?.source || '').trim();
+  return source.startsWith('SeaTable:') ? source.slice('SeaTable:'.length).trim() : '';
+}
+
+function payloadWorkspaceID(payload: FollowupPayload | null = currentPayload) {
+  return String(payload?.workspace_id || '').trim();
+}
+
+function baseKey(base: SeaTableBase) {
+  return `${base.workspace_id || ''}\u0000${base.name}`;
+}
+
+function sameBase(base: SeaTableBase, name: string, workspaceID: string) {
+  if (!base || base.name !== name) return false;
+  return !workspaceID || !base.workspace_id || base.workspace_id === workspaceID;
+}
+
+function findBase(name: string, workspaceID = '') {
+  const trimmedName = name.trim();
+  const trimmedWorkspaceID = workspaceID.trim();
+  if (!trimmedName) return null;
+  return availableBases.find((base) => sameBase(base, trimmedName, trimmedWorkspaceID))
+    || availableBases.find((base) => base.name === trimmedName)
+    || null;
+}
+
+function baseByKey(key: string) {
+  return availableBases.find((base) => baseKey(base) === key) || null;
+}
+
+function currentBaseRequest() {
+  const baseName = selectedBase?.name || payloadBaseName();
+  const workspaceID = selectedBase?.workspace_id || payloadWorkspaceID();
+  return {
+    base_name: baseName,
+    workspace_id: workspaceID,
+  };
+}
+
+function attachCurrentBase(payload: FollowupPayload): FollowupPayload {
+  const current = currentBaseRequest();
+  if (!current.base_name) return payload;
+  return {
+    ...payload,
+    source: `SeaTable:${current.base_name}`,
+    base_name: current.base_name,
+    workspace_id: current.workspace_id,
+  };
 }
 
 function detailMeta(group: ColumnGroup, columns: DetailColumn[]) {
@@ -1091,6 +1159,79 @@ function hasRawTables(payload: FollowupPayload) {
   return Array.isArray(payload.raw_tables) && payload.raw_tables.length > 0;
 }
 
+function updateBaseSwitch(payload: FollowupPayload | null = null) {
+  baseSwitchEl.replaceChildren();
+  if (payload) {
+    const payloadName = payloadBaseName(payload);
+    const payloadWorkspace = payloadWorkspaceID(payload);
+    const matched = findBase(payloadName, payloadWorkspace);
+    if (matched) {
+      selectedBase = matched;
+    } else if (payloadName && !selectedBase) {
+      selectedBase = { name: payloadName, workspace_id: payloadWorkspace };
+    }
+  }
+  if (!selectedBase && availableBases.length) {
+    selectedBase = availableBases[0];
+  }
+
+  const options = availableBases.length ? availableBases : selectedBase ? [selectedBase] : [];
+  if (!options.length) {
+    baseSwitchEl.hidden = true;
+    baseSwitchEl.disabled = true;
+    return;
+  }
+
+  options.forEach((base) => {
+    const option = document.createElement('option');
+    option.value = baseKey(base);
+    option.textContent = base.label || base.name;
+    baseSwitchEl.appendChild(option);
+  });
+  baseSwitchEl.hidden = false;
+  baseSwitchEl.disabled = options.length < 2 || isRefreshing;
+  if (selectedBase) baseSwitchEl.value = baseKey(selectedBase);
+}
+
+async function loadBaseOptions() {
+  const previousBase = selectedBase;
+  try {
+    const response = await fetch('/api/bases', { method: 'GET' });
+    const result = await response.json();
+    if (!response.ok || !result.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    availableBases = Array.isArray(result.bases)
+      ? result.bases
+        .map((base: any) => ({
+          name: String(base.name || '').trim(),
+          workspace_id: String(base.workspace_id || '').trim(),
+          uuid: String(base.uuid || '').trim(),
+          label: String(base.label || base.name || '').trim(),
+          workspace_name: String(base.workspace_name || '').trim(),
+          workspace_type: String(base.workspace_type || '').trim(),
+        }))
+        .filter((base: SeaTableBase) => base.name)
+      : [];
+    const selected = result.selected || {};
+    const selectedName = String(selected.name || '').trim();
+    const selectedWorkspaceID = String(selected.workspace_id || '').trim();
+    const apiSelectedBase = findBase(selectedName, selectedWorkspaceID) || (selectedName ? {
+      name: selectedName,
+      workspace_id: selectedWorkspaceID,
+      label: String(selected.label || selectedName),
+    } : null);
+    selectedBase = previousBase
+      ? findBase(previousBase.name, previousBase.workspace_id) || previousBase
+      : apiSelectedBase || selectedBase;
+    updateBaseSwitch();
+  } catch (error) {
+    if (!selectedBase && currentPayload) {
+      const name = payloadBaseName(currentPayload);
+      if (name) selectedBase = { name, workspace_id: payloadWorkspaceID(currentPayload) };
+    }
+    updateBaseSwitch();
+  }
+}
+
 function rawTableIndexFromSheetId(sheetId: string) {
   if (!sheetId.startsWith(RAW_SHEET_PREFIX)) return -1;
   const index = Number(sheetId.slice(RAW_SHEET_PREFIX.length));
@@ -1643,6 +1784,7 @@ function syncSummary(payload: FollowupPayload, suffix: string) {
 
 function updatePayloadSummary(payload: FollowupPayload, suffix = '') {
   currentPayload = payload;
+  updateBaseSwitch(payload);
   updateRawTableSwitch(payload);
   summaryEl.hidden = false;
   const tail = suffix ? ` · ${suffix}` : '';
@@ -1706,11 +1848,12 @@ async function saveCurrentWorkbook(mode: '手动' | '自动', finishEditing: boo
       return;
     }
     if (await refreshBeforeSaveIfNeeded(hash)) return;
-    const payload = payloadFromSnapshot(snapshot, currentPayload);
+    const payload = attachCurrentBase(payloadFromSnapshot(snapshot, currentPayload));
+    const baseRequest = currentBaseRequest();
     const response = await fetch('/api/save', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ payload, snapshot, expected_signature: lastRemoteSignature }),
+      body: JSON.stringify({ ...baseRequest, payload, snapshot, expected_signature: lastRemoteSignature }),
     });
     const result = await response.json();
     if (!response.ok || !result.ok) {
@@ -1751,11 +1894,15 @@ async function refreshFromSeaTable(mode: '手动' | '自动') {
   isRefreshing = true;
   try {
     if (mode === '手动') refreshSyncEl.disabled = true;
+    updateBaseSwitch();
+    if (mode === '手动') await loadBaseOptions();
     setSyncStatus(mode === '自动' ? '检测到 SeaTable 新版本，正在同步' : '正在从 SeaTable 刷新');
+    const baseRequest = currentBaseRequest();
+    if (!baseRequest.base_name) throw new Error('未选择 SeaTable 表格');
     const response = await fetch('/api/refresh', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ force: true }),
+      body: JSON.stringify({ force: true, ...baseRequest }),
     });
     const result = await response.json();
     if (!response.ok || !result.ok) throw new Error(result.error || `HTTP ${response.status}`);
@@ -1776,6 +1923,7 @@ async function refreshFromSeaTable(mode: '手动' | '自动') {
     if (mode === '手动') refreshSyncEl.disabled = false;
   } finally {
     if (mode === '手动') refreshSyncEl.disabled = false;
+    updateBaseSwitch();
   }
 }
 
@@ -1783,7 +1931,7 @@ async function pollRemoteState() {
   const response = await fetch('/api/remote-state', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: '{}',
+    body: JSON.stringify(currentBaseRequest()),
   });
   const result = await response.json();
   if (!response.ok || !result.ok) throw new Error(result.error || `HTTP ${response.status}`);
@@ -1919,6 +2067,9 @@ async function boot() {
   saveSyncEl.hidden = true;
   await loadCustomColumnGroups();
   const payload: FollowupPayload = await fetch('/followup.json').then((response) => response.json());
+  currentPayload = payload;
+  await loadBaseOptions();
+  updateBaseSwitch(payload);
   mountWorkbook(payload, '已加载，正在从 SeaTable 同步');
   void refreshFromSeaTable('自动');
 }
@@ -1933,6 +2084,17 @@ refreshSyncEl.addEventListener('click', async () => {
 
 rawTableSwitchEl.addEventListener('change', () => {
   activateRawTable(Number(rawTableSwitchEl.value));
+});
+
+baseSwitchEl.addEventListener('change', async () => {
+  const nextBase = baseByKey(baseSwitchEl.value);
+  if (!nextBase || (selectedBase && baseKey(nextBase) === baseKey(selectedBase))) return;
+  selectedBase = nextBase;
+  lastRemoteSignature = '';
+  lastSavedWorkbookHash = '';
+  lastLocalSaveAt = 0;
+  setSyncStatus(`正在切换到 ${nextBase.label || nextBase.name}`);
+  await refreshFromSeaTable('手动');
 });
 
 window.addEventListener('focus', () => {

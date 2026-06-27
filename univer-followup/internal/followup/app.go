@@ -46,7 +46,7 @@ type appConfig struct {
 type app struct {
 	cfg         appConfig
 	httpClient  *http.Client
-	accessInfo  map[string]any
+	accessInfo  map[string]map[string]any
 	tableNames  map[string]string
 	xlsxHeaders []string
 	mu          sync.Mutex
@@ -62,6 +62,17 @@ type saveRequest struct {
 	Snapshot          any
 	ExpectedSignature string
 	Force             bool
+	BaseName          string
+	WorkspaceID       string
+}
+
+type baseInfo struct {
+	Name          string `json:"name"`
+	WorkspaceID   string `json:"workspace_id"`
+	UUID          string `json:"uuid,omitempty"`
+	Label         string `json:"label,omitempty"`
+	WorkspaceName string `json:"workspace_name,omitempty"`
+	WorkspaceType string `json:"workspace_type,omitempty"`
 }
 
 var patientToSeaTable = map[string]string{
@@ -121,13 +132,14 @@ func loadConfig() appConfig {
 }
 
 func newApp(cfg appConfig) *app {
-	a := &app{cfg: cfg, httpClient: &http.Client{Timeout: 25 * time.Second}}
+	a := &app{cfg: cfg, httpClient: &http.Client{Timeout: 25 * time.Second}, accessInfo: map[string]map[string]any{}}
 	a.xlsxHeaders = readStringSlice(cfg.xlsxHeadersPath)
 	return a
 }
 
 func (a *app) routes() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/api/bases", a.handleBases)
 	mux.HandleFunc("/api/remote-state", a.handleRemoteState)
 	mux.HandleFunc("/api/column-groups", a.handleColumnGroups)
 	mux.HandleFunc("/api/refresh", a.handleRefresh)
@@ -195,12 +207,44 @@ func (a *app) handleColumnGroups(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (a *app) handleBases(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, apiError{OK: false, Error: "method not allowed"})
+		return
+	}
+	bases, err := a.seatableBases()
+	selected := baseInfo{
+		Name:        a.resolveBaseName(""),
+		WorkspaceID: a.resolveWorkspaceID(""),
+	}
+	if selected.Name != "" {
+		selected.Label = selected.Name
+	}
+	if err != nil && len(bases) == 0 {
+		if selected.Name == "" {
+			writeJSON(w, http.StatusInternalServerError, apiError{OK: false, Error: err.Error()})
+			return
+		}
+		bases = []baseInfo{selected}
+	}
+	response := map[string]any{"ok": true, "bases": bases, "selected": selected}
+	if err != nil {
+		response["warning"] = err.Error()
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
 func (a *app) handleRemoteState(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, apiError{OK: false, Error: "method not allowed"})
 		return
 	}
-	state, err := a.remoteState()
+	var req struct {
+		BaseName    string `json:"base_name"`
+		WorkspaceID string `json:"workspace_id"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	state, err := a.remoteState(req.BaseName, req.WorkspaceID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, apiError{OK: false, Error: err.Error()})
 		return
@@ -213,21 +257,26 @@ func (a *app) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, apiError{OK: false, Error: "method not allowed"})
 		return
 	}
-	var req map[string]any
+	var req struct {
+		Force       bool   `json:"force"`
+		BaseName    string `json:"base_name"`
+		WorkspaceID string `json:"workspace_id"`
+	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	force, _ := req["force"].(bool)
-	if !force {
-		if payload, ok := a.currentStructuredPayload(); ok {
+	baseName := a.resolveBaseName(req.BaseName)
+	workspaceID := a.resolveWorkspaceID(req.WorkspaceID)
+	if !req.Force {
+		if payload, ok := a.currentStructuredPayload(baseName, workspaceID); ok {
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "payload": payload, "counts": payloadCounts(payload), "preserved": true})
 			return
 		}
 	}
-	payload, err := a.refreshFromSeaTable()
+	payload, err := a.refreshFromSeaTable(baseName, workspaceID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, apiError{OK: false, Error: err.Error()})
 		return
 	}
-	state, _ := a.remoteState()
+	state, _ := a.remoteState(baseName, workspaceID)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "payload": payload, "counts": payloadCounts(payload), "preserved": false, "state": state})
 }
 
@@ -241,6 +290,11 @@ func (a *app) handleSave(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, apiError{OK: false, Error: err.Error()})
 		return
 	}
+	req.BaseName = a.resolveBaseName(req.BaseName)
+	req.WorkspaceID = a.resolveWorkspaceID(req.WorkspaceID)
+	req.Payload["base_name"] = req.BaseName
+	req.Payload["workspace_id"] = req.WorkspaceID
+	req.Payload["source"] = "SeaTable:" + req.BaseName
 	if conflict, err := a.remoteSignatureConflict(req); err != nil {
 		writeJSON(w, http.StatusInternalServerError, apiError{OK: false, Error: err.Error()})
 		return
@@ -248,7 +302,7 @@ func (a *app) handleSave(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, conflict)
 		return
 	}
-	seatable, err := a.syncToSeaTable(req.Payload)
+	seatable, err := a.syncToSeaTable(req.Payload, req.BaseName, req.WorkspaceID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, apiError{OK: false, Error: err.Error()})
 		return
@@ -276,11 +330,21 @@ func decodeSaveRequest(body io.Reader) (saveRequest, error) {
 	}
 	expectedSignature, _ := raw["expected_signature"].(string)
 	force, _ := raw["force"].(bool)
+	baseName, _ := raw["base_name"].(string)
+	workspaceID, _ := raw["workspace_id"].(string)
+	if baseName == "" {
+		baseName = payloadBaseName(payload)
+	}
+	if workspaceID == "" {
+		workspaceID = payloadWorkspaceID(payload)
+	}
 	return saveRequest{
 		Payload:           payload,
 		Snapshot:          raw["snapshot"],
 		ExpectedSignature: expectedSignature,
 		Force:             force,
+		BaseName:          baseName,
+		WorkspaceID:       workspaceID,
 	}, nil
 }
 
@@ -288,7 +352,7 @@ func (a *app) remoteSignatureConflict(req saveRequest) (map[string]any, error) {
 	if req.ExpectedSignature == "" || req.Force {
 		return nil, nil
 	}
-	state, err := a.remoteState()
+	state, err := a.remoteState(req.BaseName, req.WorkspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -453,46 +517,153 @@ func (a *app) localBaseName() string {
 	return ""
 }
 
-func (a *app) resolvedBaseName() string {
+func payloadBaseName(data map[string]any) string {
+	if data == nil {
+		return ""
+	}
+	if name, _ := data["base_name"].(string); strings.TrimSpace(name) != "" {
+		return strings.TrimSpace(name)
+	}
+	source, _ := data["source"].(string)
+	if strings.HasPrefix(source, "SeaTable:") {
+		return strings.TrimSpace(strings.TrimPrefix(source, "SeaTable:"))
+	}
+	return ""
+}
+
+func payloadWorkspaceID(data map[string]any) string {
+	if data == nil {
+		return ""
+	}
+	if value := stringValue(data["workspace_id"]); value != "" {
+		return value
+	}
+	return ""
+}
+
+func (a *app) defaultBaseName() string {
 	if a.cfg.seatableBaseName != "" {
 		return a.cfg.seatableBaseName
-	}
-	if a.accessInfo != nil {
-		if name, _ := a.accessInfo["dtable_name"].(string); name != "" {
-			return name
-		}
 	}
 	return a.localBaseName()
 }
 
-func (a *app) seatableAccessInfo() (map[string]any, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.accessInfo != nil {
-		return a.accessInfo, nil
+func (a *app) resolveBaseName(baseName string) string {
+	if baseName = strings.TrimSpace(baseName); baseName != "" {
+		return baseName
 	}
-	token := a.configuredAccessToken()
-	if token != "" {
-		payload := decodeJWTPayload(token)
-		if exp, ok := payload["exp"].(float64); ok && int64(exp) > time.Now().Unix()+60 {
-			a.accessInfo = map[string]any{
-				"access_token": token,
-				"dtable_uuid":  firstString(payload["dtable_uuid"], a.cfg.seatableBaseUUID),
-				"dtable_name":  a.resolvedBaseName(),
+	return a.defaultBaseName()
+}
+
+func (a *app) resolveWorkspaceID(workspaceID string) string {
+	if workspaceID = strings.TrimSpace(workspaceID); workspaceID != "" {
+		return workspaceID
+	}
+	return a.cfg.seatableWorkspaceID
+}
+
+func baseCacheKey(workspaceID, baseName string) string {
+	return workspaceID + "\x00" + baseName
+}
+
+func stringValue(value any) string {
+	if value == nil {
+		return ""
+	}
+	text := strings.TrimSpace(fmt.Sprint(value))
+	if text == "<nil>" {
+		return ""
+	}
+	return text
+}
+
+func (a *app) seatableBases() ([]baseInfo, error) {
+	out, err := a.seatableAPI("/api/v2.1/workspaces/?detail=true", http.MethodGet, nil, "", false)
+	if err != nil {
+		return nil, err
+	}
+	var bases []baseInfo
+	seen := map[string]bool{}
+	addTables := func(workspace map[string]any, key string) {
+		workspaceID := stringValue(workspace["id"])
+		workspaceName := stringValue(workspace["name"])
+		workspaceType := stringValue(workspace["type"])
+		for _, table := range asRows(workspace[key]) {
+			name := stringValue(table["name"])
+			if name == "" {
+				continue
 			}
-			return a.accessInfo, nil
+			tableWorkspaceID := firstNonEmpty(stringValue(table["workspace_id"]), workspaceID, a.cfg.seatableWorkspaceID)
+			if tableWorkspaceID == "" {
+				continue
+			}
+			cacheKey := baseCacheKey(tableWorkspaceID, name)
+			if seen[cacheKey] {
+				continue
+			}
+			seen[cacheKey] = true
+			label := name
+			if workspaceName != "" && workspaceName != "personal" && workspaceName != "shared" && workspaceName != "starred" {
+				label = name + " · " + workspaceName
+			}
+			bases = append(bases, baseInfo{
+				Name:          name,
+				WorkspaceID:   tableWorkspaceID,
+				UUID:          stringValue(table["uuid"]),
+				Label:         label,
+				WorkspaceName: workspaceName,
+				WorkspaceType: workspaceType,
+			})
 		}
 	}
-	baseName := a.resolvedBaseName()
+	for _, workspace := range asRows(out["workspace_list"]) {
+		addTables(workspace, "table_list")
+		addTables(workspace, "shared_table_list")
+		addTables(workspace, "group_shared_dtables")
+	}
+	return bases, nil
+}
+
+func (a *app) seatableAccessInfo(baseName, workspaceID string) (map[string]any, error) {
+	baseName = a.resolveBaseName(baseName)
+	workspaceID = a.resolveWorkspaceID(workspaceID)
 	if baseName == "" {
 		return nil, errors.New("无法确定 SeaTable base 名称，请设置 SEATABLE_BASE_NAME")
 	}
-	path := fmt.Sprintf("/api/v2.1/workspace/%s/dtable/%s/access-token/", a.cfg.seatableWorkspaceID, url.PathEscape(baseName))
+	cacheKey := baseCacheKey(workspaceID, baseName)
+	a.mu.Lock()
+	if info := a.accessInfo[cacheKey]; info != nil {
+		a.mu.Unlock()
+		return info, nil
+	}
+	a.mu.Unlock()
+
+	token := a.configuredAccessToken()
+	if token != "" && a.cfg.seatableAdminToken == "" {
+		if defaultName := a.defaultBaseName(); defaultName != "" && defaultName != baseName {
+			return nil, errors.New("切换 SeaTable base 需要配置 SEATABLE_ADMIN_TOKEN")
+		}
+		payload := decodeJWTPayload(token)
+		if exp, ok := payload["exp"].(float64); ok && int64(exp) > time.Now().Unix()+60 {
+			info := map[string]any{
+				"access_token": token,
+				"dtable_uuid":  firstString(payload["dtable_uuid"], a.cfg.seatableBaseUUID),
+				"dtable_name":  baseName,
+				"workspace_id": workspaceID,
+			}
+			a.mu.Lock()
+			a.accessInfo[cacheKey] = info
+			a.mu.Unlock()
+			return info, nil
+		}
+	}
+	path := fmt.Sprintf("/api/v2.1/workspace/%s/dtable/%s/access-token/", workspaceID, url.PathEscape(baseName))
 	info, err := a.seatableAPI(path, http.MethodGet, nil, "", false)
 	if err != nil {
 		return nil, err
 	}
 	info["dtable_name"] = baseName
+	info["workspace_id"] = workspaceID
 	if info["dtable_uuid"] == nil {
 		if access, _ := info["access_token"].(string); access != "" {
 			payload := decodeJWTPayload(access)
@@ -501,7 +672,9 @@ func (a *app) seatableAccessInfo() (map[string]any, error) {
 			}
 		}
 	}
-	a.accessInfo = info
+	a.mu.Lock()
+	a.accessInfo[cacheKey] = info
+	a.mu.Unlock()
 	return info, nil
 }
 
@@ -514,8 +687,8 @@ func firstString(values ...any) string {
 	return ""
 }
 
-func (a *app) seatableAccessToken() (string, error) {
-	info, err := a.seatableAccessInfo()
+func (a *app) seatableAccessToken(baseName, workspaceID string) (string, error) {
+	info, err := a.seatableAccessInfo(baseName, workspaceID)
 	if err != nil {
 		return "", err
 	}
@@ -526,11 +699,13 @@ func (a *app) seatableAccessToken() (string, error) {
 	return token, nil
 }
 
-func (a *app) seatableBaseUUID() (string, error) {
-	if a.cfg.seatableBaseUUID != "" {
+func (a *app) seatableBaseUUID(baseName, workspaceID string) (string, error) {
+	resolvedName := a.resolveBaseName(baseName)
+	resolvedWorkspaceID := a.resolveWorkspaceID(workspaceID)
+	if a.cfg.seatableBaseUUID != "" && a.cfg.seatableBaseName != "" && resolvedName == a.cfg.seatableBaseName && resolvedWorkspaceID == a.cfg.seatableWorkspaceID {
 		return a.cfg.seatableBaseUUID, nil
 	}
-	info, err := a.seatableAccessInfo()
+	info, err := a.seatableAccessInfo(resolvedName, resolvedWorkspaceID)
 	if err != nil {
 		return "", err
 	}
@@ -583,8 +758,8 @@ func (a *app) seatableAPI(path, method string, payload any, token string, dtable
 	return out, nil
 }
 
-func (a *app) dtableMetadata(token string) (map[string]any, error) {
-	uuid, err := a.seatableBaseUUID()
+func (a *app) dtableMetadata(token, baseName, workspaceID string) (map[string]any, error) {
+	uuid, err := a.seatableBaseUUID(baseName, workspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -599,14 +774,14 @@ func (a *app) dtableMetadata(token string) (map[string]any, error) {
 	return meta, nil
 }
 
-func (a *app) targetTableNames(meta map[string]any) map[string]string {
+func (a *app) targetTableNames(meta map[string]any, baseName string) map[string]string {
 	var names []string
 	for _, table := range asRows(meta["tables"]) {
 		if name, _ := table["name"].(string); name != "" {
 			names = append(names, name)
 		}
 	}
-	baseName := a.resolvedBaseName()
+	baseName = a.resolveBaseName(baseName)
 	primary := a.cfg.seatableTableName
 	if primary != "" && !contains(names, primary) {
 		primary = ""
@@ -649,8 +824,8 @@ func contains(values []string, target string) bool {
 	return false
 }
 
-func (a *app) gatewayRows(token, tableName string) ([]map[string]any, error) {
-	uuid, err := a.seatableBaseUUID()
+func (a *app) gatewayRows(token, tableName, baseName, workspaceID string) ([]map[string]any, error) {
+	uuid, err := a.seatableBaseUUID(baseName, workspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -673,12 +848,14 @@ func (a *app) gatewayRows(token, tableName string) ([]map[string]any, error) {
 	return asRows(out["rows"]), nil
 }
 
-func (a *app) remoteState() (map[string]any, error) {
-	token, err := a.seatableAccessToken()
+func (a *app) remoteState(baseName, workspaceID string) (map[string]any, error) {
+	baseName = a.resolveBaseName(baseName)
+	workspaceID = a.resolveWorkspaceID(workspaceID)
+	token, err := a.seatableAccessToken(baseName, workspaceID)
 	if err != nil {
 		return nil, err
 	}
-	meta, err := a.dtableMetadata(token)
+	meta, err := a.dtableMetadata(token, baseName, workspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -692,7 +869,7 @@ func (a *app) remoteState() (map[string]any, error) {
 	counts := map[string]int{}
 	latest := ""
 	for _, table := range tables {
-		rows, err := a.gatewayRows(token, table)
+		rows, err := a.gatewayRows(token, table, baseName, workspaceID)
 		if err != nil {
 			return nil, err
 		}
@@ -714,7 +891,7 @@ func (a *app) remoteState() (map[string]any, error) {
 		}
 		parts = append(parts, table, strings.Join(columns, ","), strconv.Itoa(counts[table]))
 	}
-	return map[string]any{"latest_mtime": latest, "counts": counts, "signature": strings.Join(parts, "|")}, nil
+	return map[string]any{"base_name": baseName, "workspace_id": workspaceID, "latest_mtime": latest, "counts": counts, "signature": strings.Join(parts, "|")}, nil
 }
 
 func tableColumnDefs(meta map[string]any, tableName string) []map[string]any {
@@ -781,7 +958,7 @@ func readableValue(value any, column map[string]any) string {
 	return fmt.Sprint(value)
 }
 
-func (a *app) namedRows(token string, meta map[string]any, tableName string) ([]map[string]any, error) {
+func (a *app) namedRows(token string, meta map[string]any, tableName, baseName, workspaceID string) ([]map[string]any, error) {
 	columns := tableColumnDefs(meta, tableName)
 	keyToColumn := map[string]map[string]any{}
 	for _, col := range columns {
@@ -790,7 +967,7 @@ func (a *app) namedRows(token string, meta map[string]any, tableName string) ([]
 			keyToColumn[key] = col
 		}
 	}
-	rawRows, err := a.gatewayRows(token, tableName)
+	rawRows, err := a.gatewayRows(token, tableName, baseName, workspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -808,7 +985,7 @@ func (a *app) namedRows(token string, meta map[string]any, tableName string) ([]
 	return rows, nil
 }
 
-func (a *app) rawTablesFromSeaTable(token string, meta map[string]any) ([]map[string]any, error) {
+func (a *app) rawTablesFromSeaTable(token string, meta map[string]any, baseName, workspaceID string) ([]map[string]any, error) {
 	var tables []map[string]any
 	for _, table := range asRows(meta["tables"]) {
 		name, _ := table["name"].(string)
@@ -821,7 +998,7 @@ func (a *app) rawTablesFromSeaTable(token string, meta map[string]any) ([]map[st
 				columns = append(columns, colName)
 			}
 		}
-		rows, err := a.namedRows(token, meta, name)
+		rows, err := a.namedRows(token, meta, name, baseName, workspaceID)
 		if err != nil {
 			return nil, err
 		}
@@ -834,8 +1011,8 @@ func (a *app) rawTablesFromSeaTable(token string, meta map[string]any) ([]map[st
 	return tables, nil
 }
 
-func (a *app) upsertRow(token, tableName, rowID string, row map[string]any) error {
-	uuid, err := a.seatableBaseUUID()
+func (a *app) upsertRow(token, tableName, rowID string, row map[string]any, baseName, workspaceID string) error {
+	uuid, err := a.seatableBaseUUID(baseName, workspaceID)
 	if err != nil {
 		return err
 	}
@@ -849,11 +1026,11 @@ func (a *app) upsertRow(token, tableName, rowID string, row map[string]any) erro
 	return err
 }
 
-func (a *app) deleteRow(token, tableName, rowID string) error {
+func (a *app) deleteRow(token, tableName, rowID, baseName, workspaceID string) error {
 	if strings.TrimSpace(rowID) == "" {
 		return nil
 	}
-	uuid, err := a.seatableBaseUUID()
+	uuid, err := a.seatableBaseUUID(baseName, workspaceID)
 	if err != nil {
 		return err
 	}
@@ -950,7 +1127,7 @@ func markPresent(keys map[string]bool, key string) {
 	}
 }
 
-func (a *app) snapshotSeaTableState(token string, meta map[string]any) {
+func (a *app) snapshotSeaTableState(token string, meta map[string]any, baseName, workspaceID string) {
 	_ = os.MkdirAll(a.cfg.backupDir, 0755)
 	tables := map[string]any{}
 	for _, table := range asRows(meta["tables"]) {
@@ -958,14 +1135,14 @@ func (a *app) snapshotSeaTableState(token string, meta map[string]any) {
 		if name == "" {
 			continue
 		}
-		rows, err := a.namedRows(token, meta, name)
+		rows, err := a.namedRows(token, meta, name, baseName, workspaceID)
 		if err == nil {
 			tables[name] = rows
 		}
 	}
 	snapshot := map[string]any{
 		"snapshotted_at": time.Now().Format(time.RFC3339),
-		"source":         "SeaTable:" + a.resolvedBaseName(),
+		"source":         "SeaTable:" + a.resolveBaseName(baseName),
 		"tables":         tables,
 	}
 	raw, _ := json.MarshalIndent(snapshot, "", "  ")
@@ -1002,30 +1179,32 @@ func validatePayload(payload map[string]any, rawMode bool) error {
 	return nil
 }
 
-func (a *app) syncToSeaTable(payload map[string]any) (map[string]any, error) {
+func (a *app) syncToSeaTable(payload map[string]any, baseName, workspaceID string) (map[string]any, error) {
+	baseName = a.resolveBaseName(baseName)
+	workspaceID = a.resolveWorkspaceID(workspaceID)
 	rawMode := asRows(payload["raw_tables"]) != nil
 	if err := validatePayload(payload, rawMode); err != nil {
 		return nil, err
 	}
-	token, err := a.seatableAccessToken()
+	token, err := a.seatableAccessToken(baseName, workspaceID)
 	if err != nil {
 		return nil, err
 	}
-	meta, err := a.dtableMetadata(token)
+	meta, err := a.dtableMetadata(token, baseName, workspaceID)
 	if err != nil {
 		return nil, err
 	}
-	names := a.targetTableNames(meta)
+	names := a.targetTableNames(meta, baseName)
 	primaryTable := names["primary"]
 	drugTable := names["drug"]
 	followupTable := names["followup"]
-	a.snapshotSeaTableState(token, meta)
-	rawTables, rawUpdatedRows, rawDeletedRows, err := a.syncRawTablesToSeaTable(token, meta, payload)
+	a.snapshotSeaTableState(token, meta, baseName, workspaceID)
+	rawTables, rawUpdatedRows, rawDeletedRows, err := a.syncRawTablesToSeaTable(token, meta, payload, baseName, workspaceID)
 	if err != nil {
 		return nil, err
 	}
 	if rawMode {
-		state, _ := a.remoteState()
+		state, _ := a.remoteState(baseName, workspaceID)
 		return map[string]any{
 			"ok":               true,
 			"raw_tables":       rawTables,
@@ -1042,7 +1221,7 @@ func (a *app) syncToSeaTable(payload map[string]any) (map[string]any, error) {
 	if patientIDColumn == "" || patientKey == "" {
 		return nil, errors.New("SeaTable 表缺少 patient_id/类器官样本号 列")
 	}
-	rawRows, err := a.gatewayRows(token, primaryTable)
+	rawRows, err := a.gatewayRows(token, primaryTable, baseName, workspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -1077,7 +1256,7 @@ func (a *app) syncToSeaTable(payload map[string]any) (map[string]any, error) {
 		if len(patch) == 0 {
 			continue
 		}
-		if err := a.upsertRow(token, primaryTable, rowID, patch); err != nil {
+		if err := a.upsertRow(token, primaryTable, rowID, patch, baseName, workspaceID); err != nil {
 			return nil, err
 		}
 		updatedPatients++
@@ -1086,14 +1265,14 @@ func (a *app) syncToSeaTable(payload map[string]any) (map[string]any, error) {
 		if seenPatients[patientID] {
 			continue
 		}
-		if err := a.deleteRow(token, primaryTable, fmt.Sprint(row["_id"])); err != nil {
+		if err := a.deleteRow(token, primaryTable, fmt.Sprint(row["_id"]), baseName, workspaceID); err != nil {
 			return nil, err
 		}
 		deletedPatients++
 	}
 	existingDrugs := map[string]map[string]any{}
 	if drugTable != "" {
-		rows, _ := a.namedRows(token, meta, drugTable)
+		rows, _ := a.namedRows(token, meta, drugTable, baseName, workspaceID)
 		for _, row := range rows {
 			key := fmt.Sprint(row["patient_id"]) + "\x00" + fmt.Sprint(row["药物组合"])
 			existingDrugs[key] = row
@@ -1123,7 +1302,7 @@ func (a *app) syncToSeaTable(payload map[string]any) (map[string]any, error) {
 		if len(patch) == 0 {
 			continue
 		}
-		if err := a.upsertRow(token, drugTable, rowID, patch); err != nil {
+		if err := a.upsertRow(token, drugTable, rowID, patch, baseName, workspaceID); err != nil {
 			return nil, err
 		}
 		updatedDrugs++
@@ -1133,7 +1312,7 @@ func (a *app) syncToSeaTable(payload map[string]any) (map[string]any, error) {
 			if seenDrugs[key] {
 				continue
 			}
-			if err := a.deleteRow(token, drugTable, existingRowID(existingDrugs, key)); err != nil {
+			if err := a.deleteRow(token, drugTable, existingRowID(existingDrugs, key), baseName, workspaceID); err != nil {
 				return nil, err
 			}
 			deletedDrugs++
@@ -1141,7 +1320,7 @@ func (a *app) syncToSeaTable(payload map[string]any) (map[string]any, error) {
 	}
 	existingFollowups := map[string]map[string]any{}
 	if followupTable != "" {
-		rows, _ := a.namedRows(token, meta, followupTable)
+		rows, _ := a.namedRows(token, meta, followupTable, baseName, workspaceID)
 		for _, row := range rows {
 			key := fmt.Sprint(row["patient_id"]) + "\x00" + fmt.Sprint(row["随访节点"])
 			existingFollowups[key] = row
@@ -1166,7 +1345,7 @@ func (a *app) syncToSeaTable(payload map[string]any) (map[string]any, error) {
 		if len(patch) == 0 {
 			continue
 		}
-		if err := a.upsertRow(token, followupTable, rowID, patch); err != nil {
+		if err := a.upsertRow(token, followupTable, rowID, patch, baseName, workspaceID); err != nil {
 			return nil, err
 		}
 		updatedFollowups++
@@ -1176,13 +1355,13 @@ func (a *app) syncToSeaTable(payload map[string]any) (map[string]any, error) {
 			if seenFollowups[key] {
 				continue
 			}
-			if err := a.deleteRow(token, followupTable, existingRowID(existingFollowups, key)); err != nil {
+			if err := a.deleteRow(token, followupTable, existingRowID(existingFollowups, key), baseName, workspaceID); err != nil {
 				return nil, err
 			}
 			deletedFollowups++
 		}
 	}
-	state, _ := a.remoteState()
+	state, _ := a.remoteState(baseName, workspaceID)
 	return map[string]any{
 		"ok":                true,
 		"updated":           updatedPatients,
@@ -1200,7 +1379,7 @@ func (a *app) syncToSeaTable(payload map[string]any) (map[string]any, error) {
 	}, nil
 }
 
-func (a *app) syncRawTablesToSeaTable(token string, meta map[string]any, payload map[string]any) (int, int, int, error) {
+func (a *app) syncRawTablesToSeaTable(token string, meta map[string]any, payload map[string]any, baseName, workspaceID string) (int, int, int, error) {
 	changed := map[string]bool{}
 	for _, name := range asAnySlice(payload["changed_raw_tables"]) {
 		if s := strings.TrimSpace(fmt.Sprint(name)); s != "" {
@@ -1236,7 +1415,7 @@ func (a *app) syncRawTablesToSeaTable(token string, meta map[string]any, payload
 				submittedIDs[rowID] = true
 			}
 		}
-		currentRows, err := a.gatewayRows(token, tableName)
+		currentRows, err := a.gatewayRows(token, tableName, baseName, workspaceID)
 		if err != nil {
 			return updatedTables, updatedRows, deletedRows, err
 		}
@@ -1249,7 +1428,7 @@ func (a *app) syncRawTablesToSeaTable(token string, meta map[string]any, payload
 			if rowID == "" || submittedIDs[rowID] {
 				continue
 			}
-			if err := a.deleteRow(token, tableName, rowID); err != nil {
+			if err := a.deleteRow(token, tableName, rowID, baseName, workspaceID); err != nil {
 				return updatedTables, updatedRows, deletedRows, err
 			}
 			deletedRows++
@@ -1261,7 +1440,7 @@ func (a *app) syncRawTablesToSeaTable(token string, meta map[string]any, payload
 			if len(patch) == 0 {
 				continue
 			}
-			if err := a.upsertRow(token, tableName, rowID, patch); err != nil {
+			if err := a.upsertRow(token, tableName, rowID, patch, baseName, workspaceID); err != nil {
 				return updatedTables, updatedRows, deletedRows, err
 			}
 			updatedRows++
@@ -1363,22 +1542,26 @@ func deriveStructuredChildren(patients []map[string]any, headers []string) ([]ma
 	return drugs, followups
 }
 
-func (a *app) refreshFromSeaTable() (map[string]any, error) {
-	token, err := a.seatableAccessToken()
+func (a *app) refreshFromSeaTable(baseName, workspaceID string) (map[string]any, error) {
+	baseName = a.resolveBaseName(baseName)
+	workspaceID = a.resolveWorkspaceID(workspaceID)
+	token, err := a.seatableAccessToken(baseName, workspaceID)
 	if err != nil {
 		return nil, err
 	}
-	meta, err := a.dtableMetadata(token)
+	meta, err := a.dtableMetadata(token, baseName, workspaceID)
 	if err != nil {
 		return nil, err
 	}
-	rawTables, err := a.rawTablesFromSeaTable(token, meta)
+	rawTables, err := a.rawTablesFromSeaTable(token, meta, baseName, workspaceID)
 	if err != nil {
 		return nil, err
 	}
 	payload := map[string]any{
 		"generated_at":       time.Now().Format(time.RFC3339),
-		"source":             "SeaTable:" + a.resolvedBaseName(),
+		"source":             "SeaTable:" + baseName,
+		"base_name":          baseName,
+		"workspace_id":       workspaceID,
 		"xlsx_headers":       a.xlsxHeaders,
 		"patients":           []map[string]any{},
 		"drug_sensitivity":   []map[string]any{},
@@ -1390,27 +1573,29 @@ func (a *app) refreshFromSeaTable() (map[string]any, error) {
 	return payload, err
 }
 
-func (a *app) refreshStructuredFromSeaTable() (map[string]any, error) {
-	token, err := a.seatableAccessToken()
+func (a *app) refreshStructuredFromSeaTable(baseName, workspaceID string) (map[string]any, error) {
+	baseName = a.resolveBaseName(baseName)
+	workspaceID = a.resolveWorkspaceID(workspaceID)
+	token, err := a.seatableAccessToken(baseName, workspaceID)
 	if err != nil {
 		return nil, err
 	}
-	meta, err := a.dtableMetadata(token)
+	meta, err := a.dtableMetadata(token, baseName, workspaceID)
 	if err != nil {
 		return nil, err
 	}
-	names := a.targetTableNames(meta)
-	patients, err := a.namedRows(token, meta, names["primary"])
+	names := a.targetTableNames(meta, baseName)
+	patients, err := a.namedRows(token, meta, names["primary"], baseName, workspaceID)
 	if err != nil {
 		return nil, err
 	}
 	drugs := []map[string]any{}
 	followups := []map[string]any{}
 	if names["drug"] != "" {
-		drugs, _ = a.namedRows(token, meta, names["drug"])
+		drugs, _ = a.namedRows(token, meta, names["drug"], baseName, workspaceID)
 	}
 	if names["followup"] != "" {
-		followups, _ = a.namedRows(token, meta, names["followup"])
+		followups, _ = a.namedRows(token, meta, names["followup"], baseName, workspaceID)
 	}
 	if len(drugs) == 0 || len(followups) == 0 {
 		derivedDrugs, derivedFollowups := deriveStructuredChildren(patients, a.xlsxHeaders)
@@ -1426,7 +1611,9 @@ func (a *app) refreshStructuredFromSeaTable() (map[string]any, error) {
 	}
 	payload := map[string]any{
 		"generated_at":     time.Now().Format(time.RFC3339),
-		"source":           "SeaTable:" + firstNonEmpty(a.resolvedBaseName(), names["primary"]),
+		"source":           "SeaTable:" + firstNonEmpty(baseName, names["primary"]),
+		"base_name":        baseName,
+		"workspace_id":     workspaceID,
 		"xlsx_headers":     a.xlsxHeaders,
 		"patients":         patients,
 		"drug_sensitivity": drugs,
@@ -1475,7 +1662,7 @@ func (a *app) savePayload(payload map[string]any, snapshot any) (string, error) 
 	return fmt.Sprint(payload["generated_at"]), nil
 }
 
-func (a *app) currentStructuredPayload() (map[string]any, bool) {
+func (a *app) currentStructuredPayload(baseName, workspaceID string) (map[string]any, bool) {
 	body, err := os.ReadFile(a.cfg.publicJSON)
 	if err != nil {
 		return nil, false
@@ -1489,6 +1676,14 @@ func (a *app) currentStructuredPayload() (map[string]any, bool) {
 	}
 	if len(asRows(payload["patients"])) == 0 {
 		return nil, false
+	}
+	if requestedBase := a.resolveBaseName(baseName); requestedBase != "" && payloadBaseName(payload) != requestedBase {
+		return nil, false
+	}
+	if requestedWorkspace := a.resolveWorkspaceID(workspaceID); requestedWorkspace != "" {
+		if payloadWorkspace := payloadWorkspaceID(payload); payloadWorkspace != "" && payloadWorkspace != requestedWorkspace {
+			return nil, false
+		}
 	}
 	return payload, true
 }

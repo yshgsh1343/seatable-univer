@@ -11,9 +11,12 @@
         <div class="brand">
           <div class="brand-main">
             <div class="title">随访记录</div>
-            <select id="rawTableSwitch" class="raw-table-switch" aria-label="切换 SeaTable 表" hidden></select>
+            <select id="baseSwitch" class="base-switch" aria-label="切换账号内 SeaTable 表格" hidden></select>
           </div>
-          <div id="summary" class="app-summary" hidden></div>
+          <div class="brand-sub">
+            <select id="rawTableSwitch" class="raw-table-switch" aria-label="切换主表或子表" hidden></select>
+            <div id="summary" class="app-summary" hidden></div>
+          </div>
         </div>
         <div class="actions">
           <button id="openSheet" type="button">表格模式</button>

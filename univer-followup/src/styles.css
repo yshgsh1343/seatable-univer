@@ -39,10 +39,14 @@ select {
 }
 
 .brand {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
   min-width: 0;
 }
 
-.brand-main {
+.brand-main,
+.brand-sub {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -56,8 +60,8 @@ select {
 }
 
 .app-summary {
-  display: none;
-  margin-top: 4px;
+  display: block;
+  min-width: 0;
   color: #64748b;
   font-size: 12px;
   white-space: nowrap;
@@ -114,13 +118,21 @@ select {
   padding: 0 34px 0 10px;
 }
 
-.raw-table-switch {
-  width: min(320px, 36vw);
+.base-switch {
+  width: min(420px, 38vw);
   max-width: 100%;
   color: #172033;
   font-size: 13px;
 }
 
+.raw-table-switch {
+  width: min(320px, 30vw);
+  max-width: 100%;
+  color: #172033;
+  font-size: 13px;
+}
+
+.base-switch:disabled,
 .raw-table-switch:disabled {
   color: #64748b;
   cursor: default;
@@ -1125,10 +1137,12 @@ button:hover {
     width: 100%;
   }
 
-  .brand-main {
+  .brand-main,
+  .brand-sub {
     flex-wrap: wrap;
   }
 
+  .base-switch,
   .raw-table-switch {
     width: min(100%, 360px);
   }
