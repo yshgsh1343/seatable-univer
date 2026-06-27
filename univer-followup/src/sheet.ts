@@ -1,4 +1,4 @@
-import { HorizontalAlign, LocaleType, mergeLocales, Univer, UniverInstanceType } from '@univerjs/core';
+import { LocaleType, mergeLocales, Univer, UniverInstanceType } from '@univerjs/core';
 import { FUniver } from '@univerjs/core/facade';
 import DesignZhCN from '@univerjs/design/locale/zh-CN';
 import { UniverDocsPlugin } from '@univerjs/docs';
@@ -39,51 +39,36 @@ import '@univerjs/sheets-numfmt/facade';
 import '@univerjs/sheets-filter/facade';
 import '@univerjs/sheets-sort/facade';
 import '@univerjs/sheets-table/facade';
-import xlsxHeaderTemplate from '../xlsx_headers.json';
 
-type Patient = Record<string, string>;
-type DrugRow = Record<string, string>;
-type FollowupRow = Record<string, string>;
-type RawRow = Record<string, string>;
+import { baseKey, payloadBaseName as payloadBaseNameFromPayload, payloadWorkspaceID as payloadWorkspaceIDFromPayload, sameBase } from './baseModel';
+import {
+  AUTO_SAVE_INTERVAL_MS,
+  CUSTOM_COLUMN_GROUPS_KEY,
+  HEADER_ROWS,
+  HIDDEN_COLUMNS_KEY,
+  RAW_HEADER_ROWS,
+  REMOTE_POLL_INTERVAL_MS,
+  SELF_SAVE_GRACE_MS,
+  buildColumnMeta as buildColumnMetaForPayload,
+  drugTypes,
+  groupLabels,
+  groupOrder,
+  workbookHeaders as workbookHeadersForPayload,
+} from './columnModel';
+import { payloadFromSnapshot as payloadFromSnapshotForSave } from './payloadTransforms';
+import { hasRawTables, rawPayloadHasNewRows, rawSheetId, rawTableIndexFromSheetId } from './rawPayload';
+import { sheetColumnMetaFromSnapshot } from './snapshotModel';
+import { columnAddress, escapeHtml, slug } from './sheetUtils';
+import type {
+  ColumnGroup,
+  ColumnMeta,
+  CustomColumnGroup,
+  CustomColumnGroupConfig,
+  FollowupPayload,
+  SeaTableBase,
+} from './types';
+import { makeWorkbook as createWorkbook } from './workbookFactory';
 
-interface RawTable {
-  name: string;
-  columns: string[];
-  rows: RawRow[];
-}
-
-interface SeaTableBase {
-  name: string;
-  workspace_id: string;
-  uuid?: string;
-  label?: string;
-  workspace_name?: string;
-  workspace_type?: string;
-}
-
-interface FollowupPayload {
-  generated_at: string;
-  source?: string;
-  base_name?: string;
-  workspace_id?: string;
-  xlsx_headers?: string[];
-  patients: Patient[];
-  drug_sensitivity: DrugRow[];
-  followups: FollowupRow[];
-  raw_tables?: RawTable[];
-  changed_raw_tables?: string[];
-  deleted_raw_rows?: Record<string, string[]>;
-}
-
-const HEADER_ROWS = 2;
-const EXTRA_EMPTY_ROWS = 5;
-const HIDDEN_COLUMNS_KEY = 'hidden_columns_v2';
-const CUSTOM_COLUMN_GROUPS_KEY = 'custom_column_groups_v1';
-const REMOTE_POLL_INTERVAL_MS = 60000;
-const AUTO_SAVE_INTERVAL_MS = 4000;
-const SELF_SAVE_GRACE_MS = 12000;
-const RAW_HEADER_ROWS = 1;
-const RAW_SHEET_PREFIX = 'seatable-raw-';
 const expanded = localStorage.getItem('drug_columns_collapsed') === '0';
 
 const summaryEl = document.getElementById('summary')!;
@@ -115,174 +100,12 @@ let customColumnGroups: CustomColumnGroupConfig = { version: 1, groups: [] };
 let customColumnGroupEditorOpen = false;
 let lastCustomGroupMetas: ColumnMeta[] = [];
 
-const xlsxHeaders = xlsxHeaderTemplate as string[];
-const headerAliases: Record<string, string> = {
-  '类器官样本号': 'patient_id',
-  '取样时间 (年-月-日）': '取样时间',
-  '分子分型 （基因检测结果）': '分子分型',
-  '初治/复发': '病程',
-  '如复发-->治疗史': '治疗史',
-  '术后治疗方案 （年月日：方案，疗程，备注）': '术后治疗方案',
-  '用药后疗效评估结果 （年月日：增大/缩小/...）如多次复查，直至修改方案或直至临床结局描述日期': '疗效评估',
-  '临床结局 （年月日：失访/调整方案（+如非疗效原因，备注原因）/死亡/...）': '临床结局',
-  '疗效评估结果所需MR/CT评估结果 （用药后评估时间+评估意见）2': '影像评估',
-  '药敏结果': '药敏结果原文',
-};
-
-interface ColumnMeta {
-  key: string;
-  label: string;
-  group: ColumnGroup;
-  groupLabel: string;
-  sourceKey?: string;
-  drugName?: string;
-  drugField?: string;
-}
-
-type ColumnGroup = 'basic' | 'clinical' | 'pathology' | 'ihc' | 'molecular' | 'imaging' | 'drug' | 'followup';
-interface CustomColumnGroup {
-  name: string;
-  columns?: string[];
-  keys?: string[];
-  match?: string[];
-}
-interface CustomColumnGroupConfig {
-  version?: number;
-  groups: CustomColumnGroup[];
-}
-interface DetailColumn {
-  key: string;
-  label: string;
-  sourceKey?: string;
-  patterns?: string[];
-  width?: number;
-}
-
-const baseColumns = ['患者ID', '姓名', '性别', '年龄', '取样时间', '取样方式', '癌种'];
-const clinicalColumns: DetailColumn[] = [
-  { key: 'clinical-diagnosis', label: '临床诊断', sourceKey: '临床诊断结果', width: 140 },
-  { key: 'course', label: '病程', sourceKey: '病程', width: 96 },
-  { key: 'treatment-history', label: '治疗史', sourceKey: '治疗史', width: 260 },
-];
-const pathologyColumns: DetailColumn[] = [
-  { key: 'pathology-diagnosis', label: '病理诊断', sourceKey: '病理诊断结果', width: 160 },
-];
-const ihcColumns: DetailColumn[] = [
-  { key: 'ihc-raw', label: '免疫组化原文', sourceKey: '免疫组化结果', width: 260 },
-];
-const molecularColumns: DetailColumn[] = [
-  { key: 'molecular-subtype', label: '分子分型', sourceKey: '分子分型', width: 160 },
-  { key: 'idh', label: 'IDH', patterns: ['IDH-1', 'IDH1', 'IDH-2', 'IDH2'], width: 120 },
-  { key: 'mgmt', label: 'MGMT', patterns: ['MGMT'], width: 120 },
-  { key: 'tert', label: 'TERT', patterns: ['TERT'], width: 120 },
-  { key: '1p19q', label: '1p/19q', patterns: ['1p/19q', '1p', '19q'], width: 120 },
-  { key: 'atrx', label: 'ATRX', patterns: ['ATRX'], width: 120 },
-  { key: 'p53', label: 'P53', patterns: ['P53', 'TP53'], width: 120 },
-  { key: 'ki67', label: 'Ki67', patterns: ['Ki67'], width: 120 },
-  { key: 'h3k27m', label: 'H3K27M', patterns: ['H3K27M'], width: 120 },
-  { key: 'braf', label: 'BRAF', patterns: ['BRAF'], width: 120 },
-];
-const imagingColumns: DetailColumn[] = [
-  { key: 'imaging', label: '影像评估', sourceKey: '影像评估', width: 260 },
-];
-const detailColumns = [...clinicalColumns, ...pathologyColumns, ...ihcColumns, ...molecularColumns, ...imagingColumns];
-const globalColumns = ['随访条数', '随访摘要', '药敏结果原文'];
-const drugTypes = [
-  '阿霉素',
-  '阿霉素,磷酰胺氮芥',
-  '艾日布林',
-  '安罗替尼',
-  '安罗替尼,阿托伐他汀',
-  '安罗替尼,替莫唑胺',
-  '安罗替尼,替尼泊苷',
-  '伯瑞替尼',
-  '多西他赛,吉西他滨',
-  '甲基苄肼',
-  '卡博替尼',
-  '洛莫司汀',
-  '曲贝替定',
-  '顺铂,吉西他滨',
-  '替莫唑胺',
-  '替莫唑胺,阿司匹林',
-  '替莫唑胺,阿托伐他汀',
-  '替莫唑胺,伯瑞替尼',
-  '替莫唑胺,加巴喷丁',
-  '替莫唑胺,洛莫司汀',
-  '替莫唑胺,替尼泊苷',
-  '替尼泊苷',
-  '伊立替康',
-  '依托泊苷',
-  '依维莫司',
-  '依维莫司,奥曲肽',
-  '紫杉醇,替尼泊苷',
-  'VAL-083',
-];
-const drugTypeColumns = [
-  { key: 'ic50', label: 'IC50' },
-  { key: 'inhibition', label: '抑制率' },
-  { key: 'plan', label: '术后方案' },
-  { key: 'efficacy', label: '疗效评估' },
-  { key: 'outcome', label: '临床结局' },
-  { key: 'followup', label: '随访' },
-];
-const groupLabels = {
-  basic: '基本信息',
-  clinical: '临床信息',
-  pathology: '病理',
-  ihc: '组化',
-  molecular: '分子标志',
-  imaging: '影像评估',
-  drug: '按药物类型',
-  followup: '全局记录',
-} as const;
-const groupOrder: ColumnMeta['group'][] = ['basic', 'clinical', 'pathology', 'ihc', 'molecular', 'imaging', 'drug', 'followup'];
-const droppedXlsxHeaders = new Set(['序号']);
-
-const colors = {
-  basic: '#DCEBFF',
-  clinical: '#E0F2FE',
-  pathology: '#FFE7C2',
-  ihc: '#FEF3C7',
-  molecular: '#F3E8FF',
-  imaging: '#E5E7EB',
-  drug: '#DCFCE7',
-  followup: '#E0F2FE',
-  header: '#F8FAFC',
-  high: '#D1FAE5',
-  warn: '#FEF3C7',
-};
-
-function escapeHtml(value: string) {
-  return value
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#039;');
-}
-
-function slug(value: string) {
-  return value.replace(/\s+/g, '-').toLowerCase();
-}
-
 function payloadBaseName(payload: FollowupPayload | null = currentPayload) {
-  const direct = String(payload?.base_name || '').trim();
-  if (direct) return direct;
-  const source = String(payload?.source || '').trim();
-  return source.startsWith('SeaTable:') ? source.slice('SeaTable:'.length).trim() : '';
+  return payloadBaseNameFromPayload(payload);
 }
 
 function payloadWorkspaceID(payload: FollowupPayload | null = currentPayload) {
-  return String(payload?.workspace_id || '').trim();
-}
-
-function baseKey(base: SeaTableBase) {
-  return `${base.workspace_id || ''}\u0000${base.name}`;
-}
-
-function sameBase(base: SeaTableBase, name: string, workspaceID: string) {
-  if (!base || base.name !== name) return false;
-  return !workspaceID || !base.workspace_id || base.workspace_id === workspaceID;
+  return payloadWorkspaceIDFromPayload(payload);
 }
 
 function findBase(name: string, workspaceID = '') {
@@ -318,172 +141,12 @@ function attachCurrentBase(payload: FollowupPayload): FollowupPayload {
   };
 }
 
-function detailMeta(group: ColumnGroup, columns: DetailColumn[]) {
-  return columns.map((column) => ({
-    key: `${group}.${column.key}`,
-    label: column.label,
-    group,
-    groupLabel: groupLabels[group],
-    sourceKey: column.sourceKey,
-  }));
-}
-
-function uniqueColumnKey(base: string, used: Set<string>, index: number) {
-  let key = base;
-  let suffix = 0;
-  while (used.has(key)) {
-    suffix += 1;
-    key = `${base}.${index}${suffix > 1 ? `-${suffix}` : ''}`;
-  }
-  used.add(key);
-  return key;
-}
-
-function xlsxColumnMetaFromHeaders(headers: string[]) {
-  const used = new Set<string>();
-  return headers.map((rawHeader, index) => {
-    const header = String(rawHeader || '').trim() || `第${columnAddress(index)}列`;
-    const group = groupForXlsxHeader(header);
-    return {
-      key: uniqueColumnKey(`xlsx.${slug(header)}`, used, index),
-      label: header,
-      group,
-      groupLabel: groupLabels[group],
-      sourceKey: header,
-      drugName: header.startsWith('药敏_') ? header.slice(3) : undefined,
-    };
-  });
-}
-
 function workbookHeaders(payload: FollowupPayload | null = currentPayload) {
-  const headers = payload?.xlsx_headers;
-  const sourceHeaders = Array.isArray(headers) && headers.length ? headers : xlsxHeaders;
-  return sourceHeaders.filter((header) => !droppedXlsxHeaders.has(String(header).trim()));
-}
-
-function groupForXlsxHeader(header: string): ColumnGroup {
-  if (header.startsWith('药敏_')) return 'drug';
-  if (header.startsWith('临床诊断_') || header.startsWith('病程_')) return 'clinical';
-  if (header.startsWith('病理诊断_')) return 'pathology';
-  if (header.startsWith('免疫组化_')) return 'ihc';
-  if (header.startsWith('临床结局/疗效_') || header.includes('随访')) return 'followup';
-  if (header.includes('分子分型')) return 'molecular';
-  if (header.includes('MR/CT') || header.includes('影像')) return 'imaging';
-  if (['临床诊断结果', '初治/复发', '如复发-->治疗史'].includes(header)) return 'clinical';
-  if (header === '病理诊断结果') return 'pathology';
-  if (header === '免疫组化结果') return 'ihc';
-  return 'basic';
+  return workbookHeadersForPayload(payload);
 }
 
 function buildColumnMeta() {
-  const headers = workbookHeaders();
-  if (headers.length) {
-    return xlsxColumnMetaFromHeaders(headers);
-  }
-  const metas: ColumnMeta[] = [];
-  baseColumns.forEach((label) => metas.push({ key: `basic.${slug(label)}`, label, group: 'basic', groupLabel: groupLabels.basic }));
-  metas.push(...detailMeta('clinical', clinicalColumns));
-  metas.push(...detailMeta('pathology', pathologyColumns));
-  metas.push(...detailMeta('ihc', ihcColumns));
-  metas.push(...detailMeta('molecular', molecularColumns));
-  metas.push(...detailMeta('imaging', imagingColumns));
-  if (expanded) {
-    drugTypes.forEach((drug) => {
-      drugTypeColumns.forEach((field) => {
-        metas.push({
-          key: `drug.${slug(drug)}.${field.key}`,
-          label: `${drug} ${field.label}`,
-          group: 'drug',
-          groupLabel: groupLabels.drug,
-          drugName: drug,
-          drugField: field.label,
-        });
-      });
-    });
-  } else {
-    ['药敏条目数', '高抑制药物', '最高抑制率'].forEach((label) => {
-      metas.push({ key: `drug.summary.${slug(label)}`, label, group: 'drug', groupLabel: groupLabels.drug });
-    });
-  }
-  globalColumns.forEach((label) => metas.push({ key: `followup.${slug(label)}`, label, group: 'followup', groupLabel: groupLabels.followup }));
-  return metas;
-}
-
-function firstSnapshotSheet(snapshot: any) {
-  const sheets = snapshot?.sheets || {};
-  if (sheets['followup-sheet']) return sheets['followup-sheet'];
-  const orderedIds = Array.isArray(snapshot?.sheetOrder) ? snapshot.sheetOrder : [];
-  const orderedSheet = orderedIds.map((id: string) => sheets[id]).find(Boolean);
-  if (orderedSheet) return orderedSheet;
-  return Object.values(sheets)[0] || null;
-}
-
-function snapshotSheetColumnCount(sheet: any, fallbackLength = 0) {
-  let count = Math.max(Number(sheet?.columnCount) || 0, fallbackLength);
-  Object.values(sheet?.cellData || {}).forEach((row: any) => {
-    Object.keys(row || {}).forEach((column) => {
-      const index = Number(column);
-      if (Number.isFinite(index)) count = Math.max(count, index + 1);
-    });
-  });
-  return count;
-}
-
-function mergedHeaderCellText(sheet: any, rowIndex: number, columnIndex: number) {
-  const cells = sheet?.cellData || {};
-  const direct = cellText(cells[rowIndex]?.[columnIndex]);
-  if (direct) return direct;
-  const merge = (sheet?.mergeData || []).find((item: any) => (
-    item.startRow <= rowIndex
-    && item.endRow >= rowIndex
-    && item.startColumn <= columnIndex
-    && item.endColumn >= columnIndex
-  ));
-  return merge ? cellText(cells[merge.startRow]?.[merge.startColumn]) : '';
-}
-
-function rowFilledCellCount(sheet: any, rowIndex: number, columnCount: number) {
-  const scanColumns = snapshotSheetColumnCount(sheet, columnCount);
-  let count = 0;
-  for (let col = 0; col < scanColumns; col += 1) {
-    if (mergedHeaderCellText(sheet, rowIndex, col)) count += 1;
-  }
-  return count;
-}
-
-function sheetHeaderRowIndex(sheet: any) {
-  const preferredRow = currentPayload && hasRawTables(currentPayload) ? RAW_HEADER_ROWS - 1 : HEADER_ROWS - 1;
-  const columnCount = snapshotSheetColumnCount(sheet);
-  if (rowFilledCellCount(sheet, preferredRow, columnCount) > 0) return preferredRow;
-  const candidates = [preferredRow, 0, 1, 2].filter((row, index, rows) => row >= 0 && rows.indexOf(row) === index);
-  let bestRow = preferredRow;
-  let bestCount = -1;
-  candidates.forEach((row) => {
-    const count = rowFilledCellCount(sheet, row, columnCount);
-    if (count > bestCount) {
-      bestRow = row;
-      bestCount = count;
-    }
-  });
-  return bestCount > 0 ? bestRow : preferredRow;
-}
-
-function sheetHeadersFromSnapshot(snapshot: any, fallbackHeaders: string[] = []) {
-  const sheet = firstSnapshotSheet(snapshot);
-  if (!sheet) return [];
-  const rowIndex = sheetHeaderRowIndex(sheet);
-  const scanColumns = snapshotSheetColumnCount(sheet) || fallbackHeaders.length;
-  const headers: string[] = [];
-  for (let col = 0; col < scanColumns; col += 1) {
-    const header = mergedHeaderCellText(sheet, rowIndex, col) || fallbackHeaders[col] || `第${columnAddress(col)}列`;
-    headers.push(header);
-  }
-  return headers;
-}
-
-function sheetColumnMetaFromSnapshot(snapshot: any) {
-  const metas = xlsxColumnMetaFromHeaders(sheetHeadersFromSnapshot(snapshot));
-  return metas.filter((meta) => meta.label.trim());
+  return buildColumnMetaForPayload(currentPayload, expanded);
 }
 
 function customGroupMetasForCurrentPanel() {
@@ -500,36 +163,6 @@ async function currentTableColumnMeta() {
   } catch {
     return fallback;
   }
-}
-
-function markerText(patient: Patient, patterns: string[]) {
-  const source = [
-    patient['分子分型'],
-    patient['免疫组化结果'],
-    patient['治疗史'],
-  ].filter(Boolean).join('；');
-  const parts = source
-    .replace(/\r?\n/g, '，')
-    .split(/[，,；;。]/)
-    .map((item) => item.trim())
-    .filter(Boolean);
-  const matches = parts.filter((part) => patterns.some((pattern) => part.toLowerCase().includes(pattern.toLowerCase())));
-  return [...new Set(matches)].join('；');
-}
-
-function detailValue(patient: Patient, column: DetailColumn) {
-  if (column.sourceKey) return patient[column.sourceKey] || '';
-  if (column.patterns) return markerText(patient, column.patterns);
-  return '';
-}
-
-function applyDetailSnapshot(patient: Patient, columns: DetailColumn[], cells: any, row: number, startCol: number) {
-  let col = startCol;
-  columns.forEach((column) => {
-    const value = cellText(cells[row]?.[col++]);
-    if (column.sourceKey) patient[column.sourceKey] = value;
-  });
-  return col;
 }
 
 function getHiddenColumnKeys() {
@@ -617,17 +250,6 @@ function customGroupsTemplate(metas = buildColumnMeta()) {
       },
     ],
   };
-}
-
-function columnAddress(index: number) {
-  let value = index + 1;
-  let label = '';
-  while (value > 0) {
-    value -= 1;
-    label = String.fromCharCode(65 + (value % 26)) + label;
-    value = Math.floor(value / 26);
-  }
-  return label;
 }
 
 function renderCustomGroupColumnPicker(group: CustomColumnGroup, metas: ColumnMeta[]) {
@@ -852,340 +474,6 @@ function renderColumnPanel() {
   `;
 }
 
-function byPatient<T extends Record<string, string>>(items: T[]) {
-  return items.reduce<Record<string, T[]>>((acc, item) => {
-    const id = item.patient_id || '';
-    acc[id] ||= [];
-    acc[id].push(item);
-    return acc;
-  }, {});
-}
-
-function cellText(cell: any) {
-  const value = cell?.v ?? cell?.p?.body?.dataStream ?? '';
-  return String(value ?? '').replace(/\r?\n\u0002?$/, '').trim();
-}
-
-function linesToText(values: string[]) {
-  return [...new Set(values.map((value) => value.trim()).filter(Boolean))].join('\n');
-}
-
-function splitDrugClinical(value: string, drug: string) {
-  if (!value) return '';
-  return value.includes('\n') || value.includes('【') ? value : `【${drug}】${value}`;
-}
-
-function parseAssayRaw(raw: string) {
-  let ic50 = '';
-  let inhibition = '';
-  let match = raw.match(/IC50\s*=\s*([^;；,)]+)/i);
-  if (match) ic50 = match[1].trim();
-  match = raw.match(/抑制率\s*=\s*([0-9.Ee+\-]+%?)/);
-  if (match) inhibition = match[1].trim();
-  if (!ic50 || !inhibition) {
-    match = raw.match(/\(([^,，)]+)[,，]\s*([0-9.Ee+\-]+%?)\)/);
-    if (match) {
-      ic50 ||= match[1].trim();
-      inhibition ||= match[2].trim();
-    }
-  }
-  return { ic50, inhibition };
-}
-
-function xlsxValue(patient: Patient, header: string, drugs: DrugRow[], followups: FollowupRow[]) {
-  if (patient[header]) return patient[header];
-  const alias = headerAliases[header];
-  if (alias && patient[alias]) return patient[alias];
-  if (header.startsWith('药敏_')) {
-    const drugName = header.slice(3);
-    const drug = drugs.find((item) => item['药物组合'] === drugName);
-    if (!drug) return '';
-    return drug['原始值'] || `IC50=${drug.IC50 || ''}; 抑制率=${drug['抑制率'] || ''}`;
-  }
-  if (['4-17随访', '4-3随访', '3-24/25随访'].includes(header)) {
-    return followups.find((item) => item['随访节点'] === header)?.['内容'] || '';
-  }
-  return '';
-}
-
-function applyXlsxAliases(patient: Patient) {
-  patient.patient_id = patient['类器官样本号'] || patient.patient_id || '';
-  patient['类器官样本号'] = patient.patient_id;
-  Object.entries(headerAliases).forEach(([header, alias]) => {
-    if (patient[header] !== undefined) patient[alias] = patient[header] || '';
-  });
-}
-
-function payloadFromXlsxSnapshot(snapshot: any, original: FollowupPayload): FollowupPayload {
-  const originalHeaders = workbookHeaders(original);
-  const headers = sheetHeadersFromSnapshot(snapshot, originalHeaders);
-  const sheet = firstSnapshotSheet(snapshot);
-  const cells = sheet?.cellData || {};
-  const patientsById = Object.fromEntries(original.patients.map((patient) => [patient.patient_id, patient]));
-  const nextPatients: Patient[] = [];
-  const nextDrugs: DrugRow[] = [];
-  const nextFollowups: FollowupRow[] = [];
-
-  for (let row = HEADER_ROWS; row < (sheet?.rowCount || 0); row += 1) {
-    const values = Object.fromEntries(headers.map((header, col) => [header, cellText(cells[row]?.[col])]));
-    const patientId = values['类器官样本号'] || cellText(cells[row]?.[0]);
-    if (!patientId) continue;
-    const patient: Patient = {
-      ...(patientsById[patientId] || {}),
-      ...values,
-      patient_id: patientId,
-      source_row: String(patientsById[patientId]?.source_row || row - HEADER_ROWS + 2),
-    };
-    applyXlsxAliases(patient);
-    headers.filter((header) => header.startsWith('药敏_')).forEach((header) => {
-      const raw = values[header] || '';
-      if (!raw) return;
-      const { ic50, inhibition } = parseAssayRaw(raw);
-      nextDrugs.push({
-        patient_id: patientId,
-        source_row: String(patient.source_row || row - HEADER_ROWS + 2),
-        '药物组合': header.slice(3),
-        IC50: ic50,
-        '抑制率': inhibition,
-        原始值: raw,
-      });
-    });
-    ['4-17随访', '4-3随访', '3-24/25随访'].forEach((node) => {
-      const content = values[node] || '';
-      if (content) {
-        nextFollowups.push({
-          patient_id: patientId,
-          source_row: String(patient.source_row || row - HEADER_ROWS + 2),
-          随访节点: node,
-          内容: content,
-        });
-      }
-    });
-    nextPatients.push(patient);
-  }
-
-  return {
-    ...original,
-    generated_at: new Date().toISOString(),
-    xlsx_headers: headers,
-    patients: nextPatients,
-    drug_sensitivity: nextDrugs,
-    followups: nextFollowups,
-  };
-}
-
-function comparableRawRows(rows: RawRow[], columns: string[]) {
-  return JSON.stringify(rows.map((row) => {
-    const normalized: RawRow = { _id: String(row._id || '') };
-    columns.forEach((column) => {
-      normalized[column] = String(row[column] ?? '').trim();
-    });
-    return normalized;
-  }));
-}
-
-function rawColumnsFromSnapshot(sheet: any, table: RawTable) {
-  const cells = sheet?.cellData || {};
-  const fallback = table.columns || [];
-  const columnCount = Math.max(sheet?.columnCount || 0, fallback.length + 1);
-  const seen = new Set<string>();
-  const columns: string[] = [];
-
-  for (let col = 1; col < columnCount; col += 1) {
-    const header = cellText(cells[0]?.[col]) || fallback[col - 1] || '';
-    const name = header.trim();
-    if (!name || name === '_id' || seen.has(name)) continue;
-    seen.add(name);
-    columns.push(name);
-  }
-  return columns;
-}
-
-function payloadFromRawSnapshot(snapshot: any, original: FollowupPayload): FollowupPayload {
-  const rawTables = original.raw_tables || [];
-  const nextTables: RawTable[] = [];
-  const changedTables: string[] = [];
-  const markChanged = (name: string) => {
-    if (name && !changedTables.includes(name)) changedTables.push(name);
-  };
-
-  rawTables.forEach((table, tableIndex) => {
-    const sheet = snapshot?.sheets?.[rawSheetId(tableIndex)];
-    if (!sheet) {
-      nextTables.push(table);
-      return;
-    }
-    const cells = sheet?.cellData || {};
-    const columns = rawColumnsFromSnapshot(sheet, table);
-    const nextRows: RawRow[] = [];
-    const rowCount = sheet?.rowCount || 0;
-
-    for (let row = RAW_HEADER_ROWS; row < rowCount; row += 1) {
-      const rowID = cellText(cells[row]?.[0]);
-      const values: RawRow = { _id: rowID };
-      let hasValue = Boolean(rowID);
-      columns.forEach((column, index) => {
-        const value = cellText(cells[row]?.[index + 1]);
-        values[column] = value;
-        if (value) hasValue = true;
-      });
-      if (hasValue) nextRows.push(values);
-    }
-
-    if (comparableRawRows(nextRows, columns) !== comparableRawRows(table.rows || [], columns)) {
-      markChanged(table.name);
-    }
-    if (JSON.stringify(columns) !== JSON.stringify(table.columns || [])) {
-      markChanged(table.name);
-    }
-    nextTables.push({ ...table, columns, rows: nextRows });
-  });
-
-  return {
-    ...original,
-    generated_at: new Date().toISOString(),
-    raw_tables: nextTables,
-    changed_raw_tables: changedTables,
-  };
-}
-
-function payloadFromSnapshot(snapshot: any, original: FollowupPayload): FollowupPayload {
-  if (hasRawTables(original)) return payloadFromRawSnapshot(snapshot, original);
-  if (workbookHeaders(original).length) return payloadFromXlsxSnapshot(snapshot, original);
-  if (!expanded) {
-    throw new Error('请先在列显示中切换到药敏明细后再保存联动');
-  }
-  const sheet = snapshot?.sheets?.['followup-sheet'];
-  const cells = sheet?.cellData || {};
-  const drugMap = byPatient(original.drug_sensitivity);
-  const followupMap = byPatient(original.followups);
-  const patientsById = Object.fromEntries(original.patients.map((patient) => [patient.patient_id, patient]));
-  const nextPatients: Patient[] = [];
-  const nextDrugs: DrugRow[] = [];
-  const nextFollowups: FollowupRow[] = [];
-
-  for (let row = HEADER_ROWS; row < (sheet?.rowCount || 0); row += 1) {
-    const patientId = cellText(cells[row]?.[0]);
-    if (!patientId) continue;
-    const originalPatient = patientsById[patientId] || { patient_id: patientId, source_row: String(row - HEADER_ROWS + 2) };
-    const patient: Patient = { ...originalPatient, patient_id: patientId };
-    let col = 0;
-    const baseValues = baseColumns.map(() => cellText(cells[row]?.[col++]));
-    [
-      patient.patient_id,
-      patient['患者姓名'],
-      patient['性别'],
-      patient['年龄'],
-      patient['取样时间'],
-      patient['取样方式'],
-      patient['癌种'],
-    ] = baseValues;
-    col = applyDetailSnapshot(patient, clinicalColumns, cells, row, col);
-    col = applyDetailSnapshot(patient, pathologyColumns, cells, row, col);
-    col = applyDetailSnapshot(patient, ihcColumns, cells, row, col);
-    col = applyDetailSnapshot(patient, molecularColumns, cells, row, col);
-    col = applyDetailSnapshot(patient, imagingColumns, cells, row, col);
-
-    const planParts: string[] = [];
-    const efficacyParts: string[] = [];
-    const outcomeParts: string[] = [];
-    const followupParts: string[] = [];
-    const originalDrugs = drugMap[patientId] || [];
-    const originalByDrug = Object.fromEntries(originalDrugs.map((drug) => [drug['药物组合'], drug]));
-
-    drugTypes.forEach((drug) => {
-      const ic50 = cellText(cells[row]?.[col++]);
-      const inhibition = cellText(cells[row]?.[col++]);
-      const plan = cellText(cells[row]?.[col++]);
-      const efficacy = cellText(cells[row]?.[col++]);
-      const outcome = cellText(cells[row]?.[col++]);
-      const followup = cellText(cells[row]?.[col++]);
-
-      if (ic50 || inhibition) {
-        nextDrugs.push({
-          ...(originalByDrug[drug] || {}),
-          patient_id: patientId,
-          source_row: String(patient.source_row || row - HEADER_ROWS + 2),
-          '药物组合': drug,
-          IC50: ic50,
-          '抑制率': inhibition,
-          原始值: `IC50=${ic50}; 抑制率=${inhibition}`,
-        });
-      }
-      if (plan) planParts.push(splitDrugClinical(plan, drug));
-      if (efficacy) efficacyParts.push(splitDrugClinical(efficacy, drug));
-      if (outcome) outcomeParts.push(splitDrugClinical(outcome, drug));
-      if (followup) followupParts.push(splitDrugClinical(followup, drug));
-    });
-
-    col += 1;
-    col += 1;
-    patient['药敏结果原文'] = cellText(cells[row]?.[col++]);
-    patient['术后治疗方案'] = linesToText(planParts) || patient['术后治疗方案'] || '';
-    patient['疗效评估'] = linesToText(efficacyParts) || patient['疗效评估'] || '';
-    patient['临床结局'] = linesToText(outcomeParts) || patient['临床结局'] || '';
-    nextFollowups.push(...(followupMap[patientId] || []));
-    nextPatients.push(patient);
-  }
-
-  return {
-    ...original,
-    generated_at: new Date().toISOString(),
-    patients: nextPatients,
-    drug_sensitivity: nextDrugs,
-    followups: nextFollowups,
-  };
-}
-
-function percentNumber(value: string | undefined) {
-  const number = Number.parseFloat(String(value || '').replace('%', ''));
-  return Number.isFinite(number) ? number : null;
-}
-
-function put(cells: any, row: number, col: number, value: string | number, style: string) {
-  cells[row] ||= {};
-  cells[row][col] = { v: value ?? '', s: style };
-}
-
-function merge(startRow: number, endRow: number, startColumn: number, endColumn: number) {
-  return { startRow, endRow, startColumn, endColumn };
-}
-
-const groupStyle: Record<ColumnGroup, string> = {
-  basic: 'groupBasic',
-  clinical: 'groupClinical',
-  pathology: 'groupPathology',
-  ihc: 'groupIhc',
-  molecular: 'groupMolecular',
-  imaging: 'groupImaging',
-  drug: 'groupDrug',
-  followup: 'groupFollowup',
-};
-
-function putDetailHeader(cells: any, merges: any[], startCol: number, group: ColumnGroup, columns: DetailColumn[]) {
-  put(cells, 0, startCol, groupLabels[group], groupStyle[group]);
-  merges.push(merge(0, 0, startCol, startCol + columns.length - 1));
-  columns.forEach((column, index) => {
-    put(cells, 1, startCol + index, column.label, 'header');
-    merges.push(merge(1, 2, startCol + index, startCol + index));
-  });
-  return startCol + columns.length;
-}
-
-function putDetailRow(cells: any, row: number, startCol: number, patient: Patient, columns: DetailColumn[]) {
-  let col = startCol;
-  columns.forEach((column) => put(cells, row, col++, detailValue(patient, column), 'wrap'));
-  return col;
-}
-
-function rawSheetId(index: number) {
-  return `${RAW_SHEET_PREFIX}${index}`;
-}
-
-function hasRawTables(payload: FollowupPayload) {
-  return Array.isArray(payload.raw_tables) && payload.raw_tables.length > 0;
-}
-
 function updateBaseSwitch(payload: FollowupPayload | null = null) {
   baseSwitchEl.replaceChildren();
   if (payload) {
@@ -1259,12 +547,6 @@ async function loadBaseOptions() {
   }
 }
 
-function rawTableIndexFromSheetId(sheetId: string) {
-  if (!sheetId.startsWith(RAW_SHEET_PREFIX)) return -1;
-  const index = Number(sheetId.slice(RAW_SHEET_PREFIX.length));
-  return Number.isInteger(index) ? index : -1;
-}
-
 function updateRawTableSwitch(payload: FollowupPayload) {
   rawTableSwitchEl.replaceChildren();
   const tables = payload.raw_tables || [];
@@ -1326,356 +608,6 @@ function activateRawTable(index: number) {
   }
 }
 
-function rawPayloadHasNewRows(payload: FollowupPayload) {
-  const changed = new Set(payload.changed_raw_tables || []);
-  return (payload.raw_tables || []).some((table) => {
-    return changed.has(table.name) && (table.rows || []).some((row) => !String(row._id || '').trim());
-  });
-}
-
-function rawCellStyle(value: string) {
-  return value.length > 36 || value.includes('\n') ? 'wrap' : 'body';
-}
-
-function makeRawWorkbook(payload: FollowupPayload) {
-  const sheets: Record<string, any> = {};
-  const sheetOrder: string[] = [];
-  const rawTables = payload.raw_tables || [];
-
-  rawTables.forEach((table, tableIndex) => {
-    const id = rawSheetId(tableIndex);
-    const columns = ['_id', ...(table.columns || [])];
-    const cells: any = {};
-    const columnData: any = { 0: { w: 80, hd: 1 } };
-    const rowData: any = { 0: { h: 34 } };
-
-    columns.forEach((column, col) => {
-      put(cells, 0, col, column, 'header');
-      if (col > 0) {
-        const width = column.length > 12 || column.includes('诊断') || column.includes('结果') || column.includes('记录') ? 220 : 132;
-        columnData[col] = { w: width };
-      }
-    });
-
-    (table.rows || []).forEach((row, rowIndex) => {
-      const sheetRow = RAW_HEADER_ROWS + rowIndex;
-      rowData[sheetRow] = { h: 36 };
-      columns.forEach((column, col) => {
-        const value = String(row[column] ?? '');
-        put(cells, sheetRow, col, value, rawCellStyle(value));
-      });
-    });
-
-    sheetOrder.push(id);
-    sheets[id] = {
-      id,
-      name: table.name || `SeaTable ${tableIndex + 1}`,
-      rowCount: (table.rows?.length || 0) + RAW_HEADER_ROWS + EXTRA_EMPTY_ROWS,
-      columnCount: columns.length,
-      defaultColumnWidth: 132,
-      defaultRowHeight: 28,
-      freeze: { xSplit: 0, ySplit: 1, startRow: 1, startColumn: 0 },
-      cellData: cells,
-      rowData,
-      columnData,
-      showGridlines: 1,
-    };
-  });
-
-  return {
-    id: 'clinical-followup-workbook',
-    name: 'SeaTable Raw Sheets',
-    appVersion: '0.25.0',
-    locale: LocaleType.ZH_CN,
-    sheetOrder,
-    styles: {
-      header: { bg: { rgb: colors.header }, bl: 1, ht: 2, vt: 2, fs: 11, tb: 2 },
-      body: { fs: 11, vt: 2, ht: HorizontalAlign.LEFT },
-      wrap: { fs: 11, vt: 1, ht: HorizontalAlign.LEFT, tb: 2 },
-    },
-    sheets,
-  };
-}
-
-function buildDrugSummary(drugs: DrugRow[]) {
-  const high = drugs.filter((row) => (percentNumber(row['抑制率']) || 0) >= 80);
-  const top = drugs.reduce<DrugRow | null>((best, row) => {
-    const value = percentNumber(row['抑制率']);
-    const bestValue = percentNumber(best?.['抑制率']);
-    if (value === null) return best;
-    return best === null || bestValue === null || value > bestValue ? row : best;
-  }, null);
-  return [
-    `${drugs.length} 条`,
-    high.map((row) => row['药物组合']).filter(Boolean).join('、') || '无 >=80%',
-    top ? `${top['药物组合']} ${top['抑制率']}` : '',
-  ];
-}
-
-function drugParts(drug: string) {
-  return drug.split(/[,，、]/).map((part) => part.trim()).filter(Boolean);
-}
-
-function textMatchesDrug(text: string, drug: string) {
-  if (!text) return false;
-  const normalized = text.toLowerCase();
-  if (normalized.includes(drug.toLowerCase())) return true;
-  const parts = drugParts(drug);
-  if (!parts.length) return false;
-  return parts.every((part) => normalized.includes(part.toLowerCase()));
-}
-
-function drugClinicalText(text: string, drug: string) {
-  return textMatchesDrug(text, drug) ? text : '';
-}
-
-function makeXlsxWorkbook(payload: FollowupPayload) {
-  const headers = workbookHeaders(payload);
-  const drugMap = byPatient(payload.drug_sensitivity);
-  const followupMap = byPatient(payload.followups);
-  const columnMeta = buildColumnMeta();
-  const hiddenColumns = getHiddenColumnKeys();
-  const cells: any = {};
-  const merges: any[] = [];
-  const columnData: any = {};
-  const rowData: any = {
-    0: { h: 34 },
-    1: { h: 32 },
-  };
-
-  let start = 0;
-  while (start < headers.length) {
-    const group = groupForXlsxHeader(headers[start]);
-    let end = start;
-    while (end + 1 < headers.length && groupForXlsxHeader(headers[end + 1]) === group) end += 1;
-    put(cells, 0, start, groupLabels[group], groupStyle[group]);
-    merges.push(merge(0, 0, start, end));
-    start = end + 1;
-  }
-
-  headers.forEach((header, index) => {
-    put(cells, 1, index, header, 'header');
-    const meta = columnMeta[index];
-    let width = 126;
-    if (header.includes('诊断') || header.includes('免疫组化') || header.includes('分子分型')) width = 180;
-    if (header.includes('随访') || header.includes('方案') || header.includes('结局') || header.includes('MR/CT')) width = 240;
-    if (header.startsWith('药敏_')) width = 150;
-    columnData[index] = { w: width, hd: meta && hiddenColumns.has(meta.key) ? 1 : 0 };
-  });
-
-  payload.patients.forEach((patient, index) => {
-    const row = HEADER_ROWS + index;
-    const drugs = drugMap[patient.patient_id] || [];
-    const followups = followupMap[patient.patient_id] || [];
-    rowData[row] = { h: 42 };
-    headers.forEach((header, col) => {
-      const value = xlsxValue(patient, header, drugs, followups);
-      const style = header.startsWith('药敏_') && (percentNumber(parseAssayRaw(value).inhibition) || 0) >= 80 ? 'high' : value.length > 36 ? 'wrap' : 'body';
-      put(cells, row, col, value || '', style);
-    });
-  });
-
-  return {
-    id: 'clinical-followup-workbook',
-    name: 'SeaTable Sheet',
-    appVersion: '0.25.0',
-    locale: LocaleType.ZH_CN,
-    sheetOrder: ['followup-sheet'],
-    styles: {
-      groupBasic: { bg: { rgb: colors.basic }, bl: 1, ht: 2, vt: 2, fs: 12 },
-      groupClinical: { bg: { rgb: colors.clinical }, bl: 1, ht: 2, vt: 2, fs: 12 },
-      groupPathology: { bg: { rgb: colors.pathology }, bl: 1, ht: 2, vt: 2, fs: 12 },
-      groupIhc: { bg: { rgb: colors.ihc }, bl: 1, ht: 2, vt: 2, fs: 12 },
-      groupMolecular: { bg: { rgb: colors.molecular }, bl: 1, ht: 2, vt: 2, fs: 12 },
-      groupImaging: { bg: { rgb: colors.imaging }, bl: 1, ht: 2, vt: 2, fs: 12 },
-      groupDrug: { bg: { rgb: colors.drug }, bl: 1, ht: 2, vt: 2, fs: 12 },
-      groupFollowup: { bg: { rgb: colors.followup }, bl: 1, ht: 2, vt: 2, fs: 12 },
-      subDrug: { bg: { rgb: '#BBF7D0' }, bl: 1, ht: 2, vt: 2, fs: 11 },
-      header: { bg: { rgb: colors.header }, bl: 1, ht: 2, vt: 2, fs: 11, tb: 2 },
-      body: { fs: 11, vt: 2, ht: HorizontalAlign.LEFT },
-      wrap: { fs: 11, vt: 1, ht: HorizontalAlign.LEFT, tb: 2 },
-      high: { bg: { rgb: colors.high }, fs: 11, vt: 2, ht: HorizontalAlign.LEFT },
-      warn: { bg: { rgb: colors.warn }, fs: 11, vt: 2, ht: HorizontalAlign.LEFT },
-    },
-    sheets: {
-      'followup-sheet': {
-        id: 'followup-sheet',
-        name: `随访总表-xlsx ${headers.length}列`,
-        rowCount: payload.patients.length + HEADER_ROWS + EXTRA_EMPTY_ROWS,
-        columnCount: headers.length,
-        defaultColumnWidth: 126,
-        defaultRowHeight: 28,
-        mergeData: merges,
-        cellData: cells,
-        rowData,
-        columnData,
-        showGridlines: 1,
-      },
-    },
-  };
-}
-
-function makeWorkbook(payload: FollowupPayload) {
-  if (hasRawTables(payload)) return makeRawWorkbook(payload);
-  if (workbookHeaders(payload).length) return makeXlsxWorkbook(payload);
-  const drugMap = byPatient(payload.drug_sensitivity);
-  const followupMap = byPatient(payload.followups);
-  const columnMeta = buildColumnMeta();
-  const hiddenColumns = getHiddenColumnKeys();
-  const cells: any = {};
-  const merges: any[] = [];
-  const columnData: any = {};
-  const rowData: any = {
-    0: { h: 34 },
-    1: { h: 32 },
-    2: { h: 32 },
-  };
-
-  let col = 0;
-  put(cells, 0, col, groupLabels.basic, 'groupBasic');
-  merges.push(merge(0, 0, col, col + baseColumns.length - 1));
-  baseColumns.forEach((label, index) => {
-    put(cells, 1, col + index, label, 'header');
-    merges.push(merge(1, 2, col + index, col + index));
-  });
-  col += baseColumns.length;
-  col = putDetailHeader(cells, merges, col, 'clinical', clinicalColumns);
-  col = putDetailHeader(cells, merges, col, 'pathology', pathologyColumns);
-  col = putDetailHeader(cells, merges, col, 'ihc', ihcColumns);
-  col = putDetailHeader(cells, merges, col, 'molecular', molecularColumns);
-  col = putDetailHeader(cells, merges, col, 'imaging', imagingColumns);
-
-  const drugStart = col;
-  if (expanded) {
-    const drugSpan = drugTypes.length * drugTypeColumns.length;
-    put(cells, 0, drugStart, '按药物类型', 'groupDrug');
-    merges.push(merge(0, 0, drugStart, drugStart + drugSpan - 1));
-    drugTypes.forEach((drug, drugIndex) => {
-      const slotCol = drugStart + drugIndex * drugTypeColumns.length;
-      put(cells, 1, slotCol, drug, 'subDrug');
-      merges.push(merge(1, 1, slotCol, slotCol + drugTypeColumns.length - 1));
-      drugTypeColumns.forEach((field, fieldIndex) => put(cells, 2, slotCol + fieldIndex, field.label, 'header'));
-    });
-    col += drugSpan;
-  } else {
-    const drugColumns = ['药敏条目数', '高抑制药物', '最高抑制率'];
-    put(cells, 0, drugStart, '药物类型摘要', 'groupDrug');
-    merges.push(merge(0, 0, drugStart, drugStart + drugColumns.length - 1));
-    drugColumns.forEach((label, index) => {
-      put(cells, 1, drugStart + index, label, 'header');
-      merges.push(merge(1, 2, drugStart + index, drugStart + index));
-    });
-    col += drugColumns.length;
-  }
-
-  put(cells, 0, col, '全局记录', 'groupFollowup');
-  merges.push(merge(0, 0, col, col + globalColumns.length - 1));
-  globalColumns.forEach((label, index) => {
-    put(cells, 1, col + index, label, 'header');
-    merges.push(merge(1, 2, col + index, col + index));
-  });
-
-  const totalColumns = col + globalColumns.length;
-  for (let i = 0; i < totalColumns; i += 1) {
-    const meta = columnMeta[i];
-    let width = 120;
-    const detailColumn = detailColumns.find((column) => meta?.key.endsWith(`.${column.key}`));
-    if (detailColumn?.width) width = detailColumn.width;
-    if (meta?.key.endsWith('.ic50') || meta?.key.endsWith('.inhibition')) width = 92;
-    if (meta?.key.endsWith('.plan') || meta?.key.endsWith('.efficacy') || meta?.key.endsWith('.outcome') || meta?.key.endsWith('.followup')) width = 184;
-    columnData[i] = { w: width, hd: meta && hiddenColumns.has(meta.key) ? 1 : 0 };
-  }
-  columnData[0] = { ...columnData[0], w: 128 };
-  columnData[1] = { ...columnData[1], w: 88 };
-
-  payload.patients.forEach((patient, index) => {
-    const row = HEADER_ROWS + index;
-    const drugs = drugMap[patient.patient_id] || [];
-    const drugsByName = drugs.reduce<Record<string, DrugRow>>((acc, item) => {
-      acc[item['药物组合']] = item;
-      return acc;
-    }, {});
-    const followups = followupMap[patient.patient_id] || [];
-    const followupText = followups.map((item) => `${item['随访节点'] || ''} ${item['内容'] || ''}`.trim()).filter(Boolean).join('\n');
-    rowData[row] = { h: 42 };
-
-    const base = [
-      patient.patient_id,
-      patient['患者姓名'],
-      patient['性别'],
-      patient['年龄'],
-      patient['取样时间'],
-      patient['取样方式'],
-      patient['癌种'],
-    ];
-    let dataCol = 0;
-    base.forEach((value) => put(cells, row, dataCol++, value || '', 'body'));
-    dataCol = putDetailRow(cells, row, dataCol, patient, clinicalColumns);
-    dataCol = putDetailRow(cells, row, dataCol, patient, pathologyColumns);
-    dataCol = putDetailRow(cells, row, dataCol, patient, ihcColumns);
-    dataCol = putDetailRow(cells, row, dataCol, patient, molecularColumns);
-    dataCol = putDetailRow(cells, row, dataCol, patient, imagingColumns);
-
-    if (expanded) {
-      drugTypes.forEach((drug) => {
-        const item = drugsByName[drug];
-        const high = (percentNumber(item?.['抑制率']) || 0) >= 80;
-        put(cells, row, dataCol++, item?.IC50 || '', 'body');
-        put(cells, row, dataCol++, item?.['抑制率'] || '', high ? 'high' : 'body');
-        put(cells, row, dataCol++, drugClinicalText(patient['术后治疗方案'] || '', drug), 'wrap');
-        put(cells, row, dataCol++, drugClinicalText(patient['疗效评估'] || '', drug), 'wrap');
-        put(cells, row, dataCol++, drugClinicalText(patient['临床结局'] || '', drug), 'wrap');
-        put(cells, row, dataCol++, drugClinicalText(followupText, drug), 'wrap');
-      });
-    } else {
-      buildDrugSummary(drugs).forEach((value, idx) => put(cells, row, dataCol++, value, idx === 1 ? 'warn' : 'body'));
-    }
-    put(cells, row, dataCol++, followups.length, followups.length ? 'body' : 'warn');
-    put(cells, row, dataCol++, followupText, 'wrap');
-    put(cells, row, dataCol++, patient['药敏结果原文'] || '', 'wrap');
-  });
-
-  const columnCount = totalColumns;
-  return {
-    id: 'clinical-followup-workbook',
-    name: 'SeaTable Sheet',
-    appVersion: '0.25.0',
-    locale: LocaleType.ZH_CN,
-    sheetOrder: ['followup-sheet'],
-    styles: {
-      groupBasic: { bg: { rgb: colors.basic }, bl: 1, ht: 2, vt: 2, fs: 12 },
-      groupClinical: { bg: { rgb: colors.clinical }, bl: 1, ht: 2, vt: 2, fs: 12 },
-      groupPathology: { bg: { rgb: colors.pathology }, bl: 1, ht: 2, vt: 2, fs: 12 },
-      groupIhc: { bg: { rgb: colors.ihc }, bl: 1, ht: 2, vt: 2, fs: 12 },
-      groupMolecular: { bg: { rgb: colors.molecular }, bl: 1, ht: 2, vt: 2, fs: 12 },
-      groupImaging: { bg: { rgb: colors.imaging }, bl: 1, ht: 2, vt: 2, fs: 12 },
-      groupDrug: { bg: { rgb: colors.drug }, bl: 1, ht: 2, vt: 2, fs: 12 },
-      groupFollowup: { bg: { rgb: colors.followup }, bl: 1, ht: 2, vt: 2, fs: 12 },
-      subDrug: { bg: { rgb: '#BBF7D0' }, bl: 1, ht: 2, vt: 2, fs: 11 },
-      header: { bg: { rgb: colors.header }, bl: 1, ht: 2, vt: 2, fs: 11 },
-      body: { fs: 11, vt: 2, ht: HorizontalAlign.LEFT },
-      wrap: { fs: 11, vt: 1, ht: HorizontalAlign.LEFT, tb: 2 },
-      high: { bg: { rgb: colors.high }, fs: 11, vt: 2, ht: HorizontalAlign.LEFT },
-      warn: { bg: { rgb: colors.warn }, fs: 11, vt: 2, ht: HorizontalAlign.LEFT },
-    },
-    sheets: {
-      'followup-sheet': {
-        id: 'followup-sheet',
-        name: expanded ? '随访总表-药敏展开' : '随访总表-药敏摘要',
-        rowCount: payload.patients.length + HEADER_ROWS + EXTRA_EMPTY_ROWS,
-        columnCount,
-        defaultColumnWidth: 118,
-        defaultRowHeight: 28,
-        mergeData: merges,
-        cellData: cells,
-        rowData,
-        columnData,
-        showGridlines: 1,
-      },
-    },
-  };
-}
-
 function activeWorkbook() {
   const api = (window as any).univerAPI;
   return api?.getActiveWorkbook?.();
@@ -1689,7 +621,7 @@ function facadeValueToText(value: any) {
 
 function ensureDataFilter(sheet: any, selectedColumn: number) {
   const rawMode = currentPayload ? hasRawTables(currentPayload) : false;
-  const rawIndex = rawMode ? Number(String(sheet.getSheetId?.() || '').replace(RAW_SHEET_PREFIX, '')) : -1;
+  const rawIndex = rawMode ? rawTableIndexFromSheetId(String(sheet.getSheetId?.() || '')) : -1;
   const rawTable = Number.isInteger(rawIndex) ? currentPayload?.raw_tables?.[rawIndex] : undefined;
   const rows = rawMode ? Math.max((rawTable?.rows?.length || 0) + 1, 1) : Math.max((currentPayload?.patients.length || 0) + 1, 1);
   const columns = rawMode ? Math.max((rawTable?.columns?.length || 0) + 1, selectedColumn + 1) : buildColumnMeta().length;
@@ -1900,7 +832,7 @@ async function saveCurrentWorkbook(mode: '手动' | '自动', finishEditing: boo
       return;
     }
     if (await refreshBeforeSaveIfNeeded(hash)) return;
-    const payload = attachCurrentBase(payloadFromSnapshot(snapshot, currentPayload));
+    const payload = attachCurrentBase(payloadFromSnapshotForSave(snapshot, currentPayload, expanded));
     const baseRequest = currentBaseRequest();
     const response = await fetch('/api/save', {
       method: 'POST',
@@ -2122,7 +1054,7 @@ function mountWorkbook(payload: FollowupPayload, status: string) {
   univer.registerPlugin(UniverSheetsSortUIPlugin);
   univer.registerPlugin(UniverSheetsTablePlugin);
 
-  univer.createUnit(UniverInstanceType.UNIVER_SHEET, makeWorkbook(payload) as any);
+  univer.createUnit(UniverInstanceType.UNIVER_SHEET, createWorkbook(payload, { expanded, hiddenColumns: getHiddenColumnKeys() }) as any);
   currentUniver = univer;
   (window as any).univer = univer;
   (window as any).univerAPI = FUniver.newAPI(univer);

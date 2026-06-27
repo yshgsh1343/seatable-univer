@@ -1,25 +1,48 @@
 # SeaTable Univer Followup
 
-SeaTable Univer Followup 是一个面向临床随访数据的 SeaTable + Univer 联动原型。项目用 Go 提供 SeaTable 数据同步 API 和静态资源服务，用 Vite/Univer 提供前端表格编辑界面，并提供 XLSX 导入工具把既有随访表导入 SeaTable。
+SeaTable Univer Followup 是一个面向单病区临床随访和类 EDC 场景的 SeaTable + Univer 联动原型。它把 SeaTable 作为结构化数据后端，把 Univer 作为接近 Notion/电子表格的前端编辑层，用 Go 提供 SeaTable 同步 API、静态资源服务和 XLSX 导入工具。
+
+当前定位是私有化、小团队使用的单病区数据采集系统雏形：重点解决表格化录入、主表/子表切换、筛选查找、列分类显示、可恢复备份和写回保护。它还不是完整合规 EDC，暂不覆盖公网安全加固、完整权限体系、审计签名、数据锁定等受监管系统能力。
 
 > 说明：本仓库只保留源码和脱敏模板，不包含真实患者数据、生产密钥、运行数据或备份文件。
 
 ## 功能特性
 
 - SeaTable 数据读取：从 SeaTable metadata 和 rows 生成前端可编辑的表格数据。
-- Univer 表格界面：用 Univer Sheets 渲染随访数据，支持列显示控制、刷新和保存联动。
-- 双向同步：前端通过 Go API 将编辑结果写回 SeaTable。
-- 覆盖保护：保存前校验 SeaTable 远端状态签名，降低覆盖他人更新的风险。
+- Univer 表格界面：用 Univer Sheets 渲染随访数据，支持筛选、排序、查找、列显示控制、刷新和保存联动。
+- 账号内表格切换：左上方 base 下拉用于切换账号/workspace 内的 SeaTable 表格。
+- 主表/子表切换：下方 raw table 下拉用于在当前 base 内切换主表和子表。
+- 双向同步：前端通过 Go API 将编辑结果写回 SeaTable，新增 raw 列会在保存时同步创建到 SeaTable。
+- 覆盖保护：保存前校验 SeaTable 远端状态签名，切换、刷新和保存时保护未保存编辑，降低覆盖他人更新的风险。
+- 删除保护：raw 表写回默认不把前端缺失行当作删除，避免误删 SeaTable 数据；显式删除能力留作后续完善。
+- 本地缓存：按 base 维度缓存前端数据，切换不同 base 时不会共用旧表缓存。
 - XLSX 导入：直接解析 OpenXML 格式的 XLSX，不依赖 Excel；支持 dry-run、替换同名表和导入前冷备份。
 - 部署模板：提供 Docker Compose 示例，包含 SeaTable、MariaDB、Redis、快照服务和 Univer/Go 服务。
-- 备份机制：Compose 快照服务周期备份数据库与 SeaTable 共享目录；导入工具在修改 SeaTable 前生成冷备份。
+- 备份机制：保存和刷新链路生成热备份，导入工具和 Compose 快照服务生成冷备份。
 
-## 技术栈
+## 单病区小 EDC 目标检查
 
-- 后端：Go 1.19，标准库 HTTP 服务。
-- 前端：TypeScript、Vite、Univer 0.25、React 19。
-- 数据服务：SeaTable Developer、MariaDB、Redis。
-- 部署：Docker Compose。
+本项目当前更适合作为单病区小 EDC 的“数据采集和表格工作台”，核心能力覆盖情况如下：
+
+| 目标能力 | 当前状态 | 说明 |
+| --- | --- | --- |
+| 类 Notion/表格化录入 | 已实现 | Univer 表格提供电子表格式录入，SeaTable 承担结构化数据存储。 |
+| 账号内表格切换 | 已实现 | base 下拉切换账号/workspace 内不同 SeaTable base。 |
+| 主表/子表切换 | 已实现 | raw table 下拉切换当前 base 内的主表、药敏表、随访表或其他子表。 |
+| 表格筛选、查找、分类列显示 | 已实现 | 接入 Univer filter/sort UI，支持右键快速筛选/清除筛选；列面板按基本信息、临床、病理、组化、分子、影像、药敏和随访分组显示，也支持自定义列组和隐藏列。 |
+| 数据回滚可恢复 | 部分实现 | 保存/刷新/导入前有 JSON、workbook、metadata 和 rows 快照，可人工恢复；尚未提供一键回滚 UI。 |
+| 备份冷热双份 | 已实现基础版 | 热备份位于 `univer-followup/sync-backups/`，冷备份位于 `univer-followup/cold-backups/` 和 Compose `backups/`。 |
+| 写回冲突保护 | 已实现 | `/api/save` 支持 `expected_signature`，远端状态变化时返回冲突。 |
+| 审计追踪、权限、锁表、电子签名 | 待完成 | 这些属于完整 EDC/受监管系统能力，本阶段未实现。 |
+
+## 技术栈选取
+
+- Go 1.19 标准库 HTTP：依赖少，适合做私有化部署中的同步 API、静态文件服务、导入 CLI 和备份前置逻辑。
+- TypeScript + Vite：前端构建简单，类型检查能覆盖表格 payload、列模型和同步请求。
+- Univer 0.25：提供接近 Excel/Notion database 的表格体验，已有筛选、排序、公式、列宽、冻结和多 sheet 能力。
+- SeaTable Developer：负责 base、table、row、column 等结构化数据存储，适合快速搭出临床随访数据表。
+- MariaDB + Redis：沿用 SeaTable 官方服务依赖，MariaDB 存储核心数据，Redis 支撑服务缓存和队列类能力。
+- Docker Compose：用于单机私有化运行 SeaTable、数据库、Redis、快照服务和本项目 Go/Univer 服务。
 
 ## 目录结构
 
@@ -35,7 +58,7 @@ SeaTable Univer Followup 是一个面向临床随访数据的 SeaTable + Univer 
     ├── internal
     │   ├── followup              # SeaTable 刷新、保存、防覆盖校验和静态文件服务
     │   └── importer              # XLSX 解析、导入计划、冷备份和 SeaTable 表替换
-    ├── src                       # Univer 前端源码
+    ├── src                       # Univer 前端源码、列模型、工作簿构建和同步转换逻辑
     ├── package.json
     ├── package-lock.json
     ├── go.mod
@@ -192,6 +215,37 @@ univer-followup/cold-backups/
 2. 点击“从 SeaTable 刷新”会调用 `/api/refresh`，从 SeaTable 拉取最新 metadata 和 rows。
 3. 点击“保存联动”会调用 `/api/save`，将当前表格数据写回 SeaTable。
 4. 保存前会用远端状态签名检测冲突；如果 SeaTable 已有新版本，接口返回 `409 Conflict`。
+5. 对 raw SeaTable 表保存时，只写回发生变化的表；新增列会先创建，缺失行不会自动删除。
+
+### 备份与恢复
+
+项目当前提供两层备份：
+
+- 热备份：刷新、保存和同步写回前会在 `univer-followup/sync-backups/` 写入本地 payload、workbook 或 SeaTable 远端快照，用于找回最近一次操作前的数据状态。
+- 冷备份：`import-xlsx` 在替换/导入表格前写入 `univer-followup/cold-backups/`；Docker Compose 的 snapshotter 会把 MariaDB dump 和 SeaTable shared 目录打包到 `backups/`。
+
+恢复方式目前是人工恢复：可以根据 manifest、metadata、rows JSON、数据库 dump 或 shared tar 包回灌到 SeaTable/数据库。还没有一键选择版本并回滚的前端 UI。
+
+### 已实现功能
+
+- SeaTable base 列表加载和账号内 base 切换。
+- 当前 base 内主表/子表切换。
+- SeaTable raw 表导入、刷新、保存和新增列同步。
+- Univer 表格筛选、排序、查找、快速筛选菜单、列隐藏和自定义列组。
+- 按临床字段分组的列面板，以及药敏摘要/明细显示。
+- 保存前远端签名冲突检测、未保存编辑切换保护和自动保存保护。
+- 按 base 隔离的前端缓存。
+- 写回前热备份、导入前冷备份和 Compose 周期快照。
+- 前端 `sheet.ts` 已拆出列模型、base 模型、raw payload、工作簿构建、snapshot 解析和保存转换模块，降低后续维护成本。
+
+### 待完成功能
+
+- 一键回滚 UI：从热备份/冷备份中选择版本并恢复。
+- 显式行删除 UI：把删除动作与普通空行/筛选隐藏区分开，避免误删。
+- 更完整的数据校验：字段类型、必填项、范围、访视窗口、跨表一致性和 query 管理。
+- EDC 审计能力：操作日志、变更原因、数据锁定、电子签名和角色权限。
+- 表结构模板化：按单病区方案快速创建主表、子表、字段和视图。
+- 自动化浏览器回归测试：覆盖 base 切换、主表/子表切换、筛选、保存、冲突和恢复流程。
 
 ### HTTP API
 
