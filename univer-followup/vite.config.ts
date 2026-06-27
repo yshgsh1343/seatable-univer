@@ -10,5 +10,14 @@ export default defineConfig({
   build: {
     sourcemap: false,
     target: 'es2020',
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return undefined;
+          if (id.includes('@univerjs')) return 'univer';
+          return 'vendor';
+        },
+      },
+    },
   },
 });

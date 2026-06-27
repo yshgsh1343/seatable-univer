@@ -83,6 +83,42 @@ func TestDeletedRawRowsRequireExplicitIDs(t *testing.T) {
 	}
 }
 
+func TestLazyRawPayloadKeepsOnlyRequestedRows(t *testing.T) {
+	payload := map[string]any{
+		"raw_tables": []map[string]any{
+			{
+				"name":      "Main",
+				"columns":   []string{"Name"},
+				"rows":      []map[string]any{{"_id": "1", "Name": "A"}},
+				"loaded":    true,
+				"row_count": 1,
+			},
+			{
+				"name":      "Child",
+				"columns":   []string{"Name"},
+				"rows":      []map[string]any{{"_id": "2", "Name": "B"}},
+				"loaded":    true,
+				"row_count": 1,
+			},
+		},
+	}
+
+	got := lazyRawPayload(payload, 1)
+	tables := asRows(got["raw_tables"])
+	if len(asRows(tables[0]["rows"])) != 0 || tables[0]["loaded"] != false {
+		t.Fatalf("non-requested table should be trimmed and marked unloaded: %#v", tables[0])
+	}
+	if len(asRows(tables[1]["rows"])) != 1 || tables[1]["loaded"] != true {
+		t.Fatalf("requested table should keep rows: %#v", tables[1])
+	}
+	if !cachedRawTableLoaded(got, 1) {
+		t.Fatal("requested loaded table should be cacheable")
+	}
+	if cachedRawTableLoaded(got, 0) {
+		t.Fatal("unloaded table should force remote refresh")
+	}
+}
+
 func TestCoerceWritableValueForSimpleTypedColumns(t *testing.T) {
 	if got := coerceWritableValue("1,234.5", map[string]any{"type": "number"}); got != 1234.5 {
 		t.Fatalf("number was not coerced: %#v", got)

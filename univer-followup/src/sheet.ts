@@ -162,6 +162,25 @@ function activeRawTableColumnMeta() {
   return rawColumnMeta(currentPayload.raw_tables?.[activeRawTableIndex()]);
 }
 
+function rawTableDisplayRows(table: { rows?: unknown[]; row_count?: number } | undefined) {
+  if (!table) return 0;
+  return Number(table.row_count) || table.rows?.length || 0;
+}
+
+function rawRefreshIndex() {
+  const savedIndex = Number(localStorage.getItem(ACTIVE_RAW_TABLE_KEY) || rawTableSwitchEl.value || '0');
+  return Number.isInteger(savedIndex) && savedIndex >= 0 ? savedIndex : 0;
+}
+
+function refreshRequestBody(force: boolean) {
+  return {
+    force,
+    lazy_raw: true,
+    raw_table_index: rawRefreshIndex(),
+    ...currentBaseRequest(),
+  };
+}
+
 function buildColumnMeta() {
   if (currentPayload && hasRawTables(currentPayload)) return activeRawTableColumnMeta();
   return buildColumnMetaForPayload(currentPayload, expanded);
@@ -578,7 +597,8 @@ function updateRawTableSwitch(payload: FollowupPayload) {
   tables.forEach((table, index) => {
     const option = document.createElement('option');
     option.value = String(index);
-    option.textContent = `${table.name || `SeaTable ${index + 1}`} (${table.rows?.length || 0})`;
+    const loadedMark = table.loaded === false ? ' · 未加载' : '';
+    option.textContent = `${table.name || `SeaTable ${index + 1}`} (${rawTableDisplayRows(table)}${loadedMark})`;
     rawTableSwitchEl.appendChild(option);
   });
   rawTableSwitchEl.hidden = false;
@@ -624,12 +644,46 @@ function bindRawTableSwitchToActiveSheet() {
   }) || null;
 }
 
-function activateRawTable(index: number) {
+async function loadRawTable(index: number) {
+  if (!currentPayload || !hasRawTables(currentPayload)) return false;
+  const table = currentPayload.raw_tables?.[index];
+  if (!table || table.loaded !== false) return true;
+  const snapshot = await workbookSnapshot(false);
+  currentPayload = attachCurrentBase(payloadFromSnapshotForSave(snapshot, currentPayload, expanded));
+  setSyncStatus(`正在加载 ${table.name || `SeaTable ${index + 1}`}`);
+  const response = await fetch('/api/raw-table', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      ...currentBaseRequest(),
+      raw_table_index: index,
+      table_name: table.name,
+    }),
+  });
+  const result = await response.json();
+  if (!response.ok || !result.ok || !result.table) throw new Error(result.error || `HTTP ${response.status}`);
+  const nextTables = [...(currentPayload.raw_tables || [])];
+  nextTables[index] = {
+    ...nextTables[index],
+    ...result.table,
+    loaded: true,
+    row_count: Number(result.table.row_count) || result.table.rows?.length || 0,
+  };
+  currentPayload = {
+    ...currentPayload,
+    raw_tables: nextTables,
+  };
+  mountWorkbook(currentPayload, `已加载 ${nextTables[index].name || `SeaTable ${index + 1}`}`);
+  return false;
+}
+
+async function activateRawTable(index: number) {
   if (!currentPayload || !hasRawTables(currentPayload) || !Number.isInteger(index)) return;
   const table = currentPayload.raw_tables?.[index];
   if (!table) return;
   const sheetId = rawSheetId(index);
   try {
+    if (!(await loadRawTable(index))) return;
     const workbook = activeWorkbook();
     if (!workbook?.setActiveSheet) throw new Error('当前工作簿不支持表切换');
     workbook.setActiveSheet(sheetId);
@@ -801,7 +855,7 @@ async function confirmDiscardUnsaved(message: string) {
 function syncSummary(payload: FollowupPayload, suffix: string) {
   summaryEl.hidden = false;
   if (hasRawTables(payload)) {
-    const rows = (payload.raw_tables || []).reduce((sum, table) => sum + (table.rows?.length || 0), 0);
+    const rows = (payload.raw_tables || []).reduce((sum, table) => sum + rawTableDisplayRows(table), 0);
     summaryEl.textContent = `${payload.raw_tables?.length || 0} 张 SeaTable 表 · ${rows} 行 · ${suffix}`;
     return;
   }
@@ -815,7 +869,7 @@ function updatePayloadSummary(payload: FollowupPayload, suffix = '') {
   summaryEl.hidden = false;
   const tail = suffix ? ` · ${suffix}` : '';
   if (hasRawTables(payload)) {
-    const rawRows = (payload.raw_tables || []).reduce((sum, table) => sum + (table.rows?.length || 0), 0);
+    const rawRows = (payload.raw_tables || []).reduce((sum, table) => sum + rawTableDisplayRows(table), 0);
     [reloadEl, customGroupToggleEl, columnPanelToggleEl].forEach((item) => {
       item.hidden = false;
     });
@@ -823,7 +877,8 @@ function updatePayloadSummary(payload: FollowupPayload, suffix = '') {
     columnPanelEl.hidden = false;
     const metas = buildColumnMeta();
     const hiddenCount = metas.filter((meta) => getHiddenColumnKeys().has(meta.key)).length;
-    summaryEl.textContent = `${payload.raw_tables?.length || 0} 张 SeaTable 表 · ${rawRows} 行 · 当前表隐藏 ${hiddenCount} 列${tail}`;
+    const unloaded = (payload.raw_tables || []).filter((table) => table.loaded === false).length;
+    summaryEl.textContent = `${payload.raw_tables?.length || 0} 张 SeaTable 表 · ${rawRows} 行 · ${unloaded} 张未加载 · 当前表隐藏 ${hiddenCount} 列${tail}`;
     renderCustomGroupPanel().catch(() => {
       customGroupPanelEl.innerHTML = renderCustomColumnGroups(buildColumnMeta(), getHiddenColumnKeys());
     });
@@ -939,7 +994,7 @@ async function refreshFromSeaTable(mode: '手动' | '自动', options: { skipDir
     const response = await fetch('/api/refresh', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ force: true, ...baseRequest }),
+      body: JSON.stringify(refreshRequestBody(true)),
     });
     const result = await response.json();
     if (!response.ok || !result.ok) throw new Error(result.error || `HTTP ${response.status}`);
@@ -949,7 +1004,7 @@ async function refreshFromSeaTable(mode: '手动' | '自动', options: { skipDir
     if (result.state?.signature) lastRemoteSignature = result.state.signature;
     isRefreshing = false;
     const status = hasRawTables(payload)
-      ? `SeaTable 已同步 · ${payload.raw_tables?.length || 0} 张表 · ${(payload.raw_tables || []).reduce((sum, table) => sum + (table.rows?.length || 0), 0)} 行`
+      ? `SeaTable 已同步 · ${payload.raw_tables?.length || 0} 张表 · ${(payload.raw_tables || []).reduce((sum, table) => sum + rawTableDisplayRows(table), 0)} 行`
       : `SeaTable 已同步 · 患者 ${counts.patients || 0} · 药敏 ${counts.drugs || 0} · 随访 ${counts.followups || 0}`;
     mountWorkbook(payload, status);
   } catch (error) {
@@ -982,7 +1037,7 @@ async function loadInitialPayload() {
       const response = await fetch('/api/refresh', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ force: false, ...baseRequest }),
+        body: JSON.stringify(refreshRequestBody(false)),
       });
       const result = await response.json();
       if (response.ok && result.ok && result.payload) return result.payload as FollowupPayload;
@@ -1110,7 +1165,12 @@ function mountWorkbook(payload: FollowupPayload, status: string) {
   registerContextMenuActions();
   if (hasRawTables(payload)) {
     const savedIndex = Number(localStorage.getItem(ACTIVE_RAW_TABLE_KEY) || rawTableSwitchEl.value || '0');
-    if (Number.isInteger(savedIndex) && payload.raw_tables?.[savedIndex]) activateRawTable(savedIndex);
+    if (Number.isInteger(savedIndex) && payload.raw_tables?.[savedIndex]) {
+      activateRawTable(savedIndex).catch((error) => {
+        setSyncStatus('切换表失败');
+        summaryEl.textContent = error instanceof Error ? error.message : String(error);
+      });
+    }
   }
   setSyncStatus(status || '初始化中');
   void rememberWorkbookHash(payload);
@@ -1143,7 +1203,10 @@ refreshSyncEl.addEventListener('click', async () => {
 });
 
 rawTableSwitchEl.addEventListener('change', () => {
-  activateRawTable(Number(rawTableSwitchEl.value));
+  activateRawTable(Number(rawTableSwitchEl.value)).catch((error) => {
+    setSyncStatus('切换表失败');
+    summaryEl.textContent = error instanceof Error ? error.message : String(error);
+  });
 });
 
 baseSwitchEl.addEventListener('change', async () => {

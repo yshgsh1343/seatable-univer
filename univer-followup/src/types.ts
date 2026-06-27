@@ -7,6 +7,8 @@ export interface RawTable {
   name: string;
   columns: string[];
   rows: RawRow[];
+  loaded?: boolean;
+  row_count?: number;
 }
 
 export interface SeaTableBase {

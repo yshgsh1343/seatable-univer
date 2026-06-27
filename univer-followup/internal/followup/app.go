@@ -144,6 +144,7 @@ func (a *app) routes() http.Handler {
 	mux.HandleFunc("/api/remote-state", a.handleRemoteState)
 	mux.HandleFunc("/api/column-groups", a.handleColumnGroups)
 	mux.HandleFunc("/api/refresh", a.handleRefresh)
+	mux.HandleFunc("/api/raw-table", a.handleRawTable)
 	mux.HandleFunc("/api/save", a.handleSave)
 	mux.HandleFunc("/", a.handleStatic)
 	return mux
@@ -259,20 +260,27 @@ func (a *app) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Force       bool   `json:"force"`
-		BaseName    string `json:"base_name"`
-		WorkspaceID string `json:"workspace_id"`
+		Force         bool   `json:"force"`
+		LazyRaw       bool   `json:"lazy_raw"`
+		RawTableIndex int    `json:"raw_table_index"`
+		BaseName      string `json:"base_name"`
+		WorkspaceID   string `json:"workspace_id"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	baseName := a.resolveBaseName(req.BaseName)
 	workspaceID := a.resolveWorkspaceID(req.WorkspaceID)
 	if !req.Force {
 		if payload, ok := a.currentStructuredPayload(baseName, workspaceID); ok {
-			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "payload": payload, "counts": payloadCounts(payload), "preserved": true})
-			return
+			if !req.LazyRaw || cachedRawTableLoaded(payload, req.RawTableIndex) {
+				if req.LazyRaw {
+					payload = lazyRawPayload(payload, req.RawTableIndex)
+				}
+				writeJSON(w, http.StatusOK, map[string]any{"ok": true, "payload": payload, "counts": payloadCounts(payload), "preserved": true})
+				return
+			}
 		}
 	}
-	payload, err := a.refreshFromSeaTable(baseName, workspaceID)
+	payload, err := a.refreshFromSeaTable(baseName, workspaceID, req.LazyRaw, req.RawTableIndex)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, apiError{OK: false, Error: err.Error()})
 		return
@@ -284,6 +292,26 @@ func (a *app) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		response["warning"] = err.Error()
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+func (a *app) handleRawTable(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, apiError{OK: false, Error: "method not allowed"})
+		return
+	}
+	var req struct {
+		BaseName      string `json:"base_name"`
+		WorkspaceID   string `json:"workspace_id"`
+		RawTableIndex int    `json:"raw_table_index"`
+		TableName     string `json:"table_name"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	table, err := a.rawTableFromSeaTable(req.BaseName, req.WorkspaceID, req.RawTableIndex, req.TableName)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiError{OK: false, Error: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "table": table})
 }
 
 func (a *app) handleSave(w http.ResponseWriter, r *http.Request) {
@@ -1035,8 +1063,12 @@ func (a *app) namedRows(token string, meta map[string]any, tableName, baseName, 
 }
 
 func (a *app) rawTablesFromSeaTable(token string, meta map[string]any, baseName, workspaceID string) ([]map[string]any, error) {
+	return a.rawTablesFromSeaTableWithLoad(token, meta, baseName, workspaceID, -1)
+}
+
+func (a *app) rawTablesFromSeaTableWithLoad(token string, meta map[string]any, baseName, workspaceID string, loadIndex int) ([]map[string]any, error) {
 	var tables []map[string]any
-	for _, table := range asRows(meta["tables"]) {
+	for index, table := range asRows(meta["tables"]) {
 		name, _ := table["name"].(string)
 		if name == "" {
 			continue
@@ -1047,17 +1079,140 @@ func (a *app) rawTablesFromSeaTable(token string, meta map[string]any, baseName,
 				columns = append(columns, colName)
 			}
 		}
-		rows, err := a.namedRows(token, meta, name, baseName, workspaceID)
-		if err != nil {
-			return nil, err
+		rows := []map[string]any{}
+		loaded := loadIndex < 0 || index == loadIndex
+		if loaded {
+			var err error
+			rows, err = a.namedRows(token, meta, name, baseName, workspaceID)
+			if err != nil {
+				return nil, err
+			}
 		}
 		tables = append(tables, map[string]any{
-			"name":    name,
-			"columns": columns,
-			"rows":    rows,
+			"name":      name,
+			"columns":   columns,
+			"rows":      rows,
+			"loaded":    loaded,
+			"row_count": tableRowCount(table, len(rows)),
 		})
 	}
 	return tables, nil
+}
+
+func tableRowCount(table map[string]any, fallback int) int {
+	for _, key := range []string{"row_count", "rows_count", "rows"} {
+		switch value := table[key].(type) {
+		case float64:
+			return int(value)
+		case int:
+			return value
+		case json.Number:
+			if n, err := value.Int64(); err == nil {
+				return int(n)
+			}
+		case []any:
+			return len(value)
+		}
+	}
+	return fallback
+}
+
+func lazyRawPayload(payload map[string]any, loadIndex int) map[string]any {
+	rawTables := asRows(payload["raw_tables"])
+	if rawTables == nil {
+		return payload
+	}
+	out := map[string]any{}
+	for key, value := range payload {
+		out[key] = value
+	}
+	if loadIndex < 0 || loadIndex >= len(rawTables) {
+		loadIndex = 0
+	}
+	nextTables := make([]map[string]any, 0, len(rawTables))
+	for index, table := range rawTables {
+		next := map[string]any{}
+		for key, value := range table {
+			next[key] = value
+		}
+		rows := asRows(table["rows"])
+		rowCount := tableRowCount(table, len(rows))
+		if index == loadIndex {
+			next["loaded"] = true
+			next["row_count"] = rowCount
+		} else {
+			next["loaded"] = false
+			next["row_count"] = rowCount
+			next["rows"] = []map[string]any{}
+		}
+		nextTables = append(nextTables, next)
+	}
+	out["raw_tables"] = nextTables
+	return out
+}
+
+func cachedRawTableLoaded(payload map[string]any, loadIndex int) bool {
+	rawTables := asRows(payload["raw_tables"])
+	if rawTables == nil {
+		return true
+	}
+	if loadIndex < 0 || loadIndex >= len(rawTables) {
+		loadIndex = 0
+	}
+	loaded, ok := rawTables[loadIndex]["loaded"].(bool)
+	return !ok || loaded
+}
+
+func (a *app) rawTableFromSeaTable(baseName, workspaceID string, rawTableIndex int, tableName string) (map[string]any, error) {
+	baseName = a.resolveBaseName(baseName)
+	workspaceID = a.resolveWorkspaceID(workspaceID)
+	token, err := a.seatableAccessToken(baseName, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	meta, err := a.dtableMetadata(token, baseName, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	tables := asRows(meta["tables"])
+	if tableName == "" {
+		if rawTableIndex < 0 || rawTableIndex >= len(tables) {
+			return nil, fmt.Errorf("raw_table_index 超出范围: %d", rawTableIndex)
+		}
+		tableName, _ = tables[rawTableIndex]["name"].(string)
+	}
+	if strings.TrimSpace(tableName) == "" {
+		return nil, errors.New("缺少 table_name")
+	}
+	var columns []string
+	found := false
+	for _, table := range tables {
+		name, _ := table["name"].(string)
+		if name != tableName {
+			continue
+		}
+		found = true
+		for _, col := range asRows(table["columns"]) {
+			if colName, _ := col["name"].(string); colName != "" {
+				columns = append(columns, colName)
+			}
+		}
+		break
+	}
+	if !found {
+		return nil, fmt.Errorf("SeaTable 表不存在: %s", tableName)
+	}
+	rows, err := a.namedRows(token, meta, tableName, baseName, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"name":      tableName,
+		"columns":   columns,
+		"rows":      rows,
+		"loaded":    true,
+		"row_count": len(rows),
+	}, nil
 }
 
 func (a *app) upsertRow(token, tableName, rowID string, row map[string]any, baseName, workspaceID string) error {
@@ -1698,7 +1853,7 @@ func deriveStructuredChildren(patients []map[string]any, headers []string) ([]ma
 	return drugs, followups
 }
 
-func (a *app) refreshFromSeaTable(baseName, workspaceID string) (map[string]any, error) {
+func (a *app) refreshFromSeaTable(baseName, workspaceID string, lazyRaw bool, rawTableIndex int) (map[string]any, error) {
 	baseName = a.resolveBaseName(baseName)
 	workspaceID = a.resolveWorkspaceID(workspaceID)
 	token, err := a.seatableAccessToken(baseName, workspaceID)
@@ -1710,6 +1865,9 @@ func (a *app) refreshFromSeaTable(baseName, workspaceID string) (map[string]any,
 		return nil, err
 	}
 	rawTables, err := a.rawTablesFromSeaTable(token, meta, baseName, workspaceID)
+	if lazyRaw {
+		rawTables, err = a.rawTablesFromSeaTableWithLoad(token, meta, baseName, workspaceID, rawTableIndex)
+	}
 	if err != nil {
 		return nil, err
 	}
